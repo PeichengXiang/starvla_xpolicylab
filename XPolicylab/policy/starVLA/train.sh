@@ -230,6 +230,7 @@ PY
 
 mkdir -p "$(dirname "${config_yaml}")"
 "${POLICY_PYTHON}" - "${base_config_yaml}" "${config_yaml}" "${data_root_dir}" "${data_mix}" "${run_id}" "${seed}" "${robot_type}" "${dataset_path}" "${base_vlm}" <<'PY'
+import hashlib
 import json
 import os
 import sys
