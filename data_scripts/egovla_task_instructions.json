@@ -1,0 +1,14 @@
+{
+  "Close-Drawer": "Close the opened drawer",
+  "Flip-Mug": "Flip the mug",
+  "Insert-And-Unload-Cans": "Insert the left can into the slot and insert the right can into the slot, unload the left cans andd then unload the right cans",
+  "Insert-Cans": "Insert cans into the boxes",
+  "Open-Drawer": "Open the closed drawer",
+  "Open-Laptop": "open the laptop",
+  "Pour-Balls": "pour balls in cup into bowl",
+  "Push-Box": "push box to the marker",
+  "Sort-Cans": "Put sprite cans to the left box, and orange cans to the right box",
+  "Stack-Can": "put can on the saucer",
+  "Stack-Can-Into-Drawer": "Open the drawer, and Put can on the saucer",
+  "Unload-Cans": "unload the right cans and then unload the left cans"
+}

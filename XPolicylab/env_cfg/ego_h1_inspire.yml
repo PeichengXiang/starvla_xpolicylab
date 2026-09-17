@@ -1,0 +1,3 @@
+config:
+  robot: ego_h1_inspire
+  sim: egovla_single

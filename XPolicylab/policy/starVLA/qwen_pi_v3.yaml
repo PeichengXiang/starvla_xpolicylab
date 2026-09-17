@@ -1,0 +1,87 @@
+run_id: starvla_qwen_pi_v3
+run_root_dir: ../checkpoints
+seed: 0
+wandb_entity: youshi-sun-yat-sen-university
+wandb_project: starvla-xpolicylab
+is_debug: false
+version_id: 0.21
+framework:
+  name: QwenPI_v3
+  qwenvl:
+    # train.sh replaces this with STARVLA_BASE_VLM (or the repository-local
+    # pretrain_model/Qwen3-VL-4B-Instruct directory) before launch.
+    base_vlm: Qwen/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2560
+  action_model:
+    action_model_type: LayerwiseFM
+    action_dim: 54
+    state_dim: 54
+    action_horizon: 16
+    future_action_window_size: 15
+    past_action_window_size: 0
+    repeated_diffusion_steps: 2
+    num_inference_timesteps: 4
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_target_vision_tokens: 32
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+      attention_head_dim: 64
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    video_backend: torchvision_av
+    # train.sh resolves and injects the repository-local data directory.
+    data_root_dir: ../../../data
+    data_mix: xpolicylab_runtime
+    action_type: abs_qpos
+    # Keep labels as the dataset's absolute raw action values.  Delta/relative
+    # modes subtract state and are intentionally forbidden for this benchmark.
+    action_mode: abs
+    action_source: raw_hdf5_action
+    action_temporal_offset: 0
+    action_derived_from_state: false
+    xpolicylab_normalization_mode: q99
+    camera_names: [cam_head, cam_left_wrist, cam_right_wrist]
+    black_camera_names: []
+    per_device_batch_size: 8
+    load_all_data_for_training: false
+    obs_image_size: [224, 224]
+    lerobot_version: v3.0
+trainer:
+  max_train_steps: 80000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 10000
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: 
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
