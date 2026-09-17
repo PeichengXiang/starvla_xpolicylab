@@ -14,6 +14,7 @@ mkdir -p \
 export STARVLA_PYTHON="${STARVLA_PYTHON:-${ROOT_DIR}/.venv-starvla/bin/python}"
 export STARVLA_DATA_ROOT="${STARVLA_DATA_ROOT:-${ROOT_DIR}/data}"
 export STARVLA_BASE_VLM="${STARVLA_BASE_VLM:-${ROOT_DIR}/pretrain_model/Qwen3-VL-4B-Instruct}"
+export CUDA_HOME="${CUDA_HOME:-/vepfs-cnbje63de6fae220/wenwei/deps/cuda-12.1}"
 export HF_HOME="${HF_HOME:-${CACHE_ROOT}/huggingface}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${CACHE_ROOT}/torch_extensions}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${CACHE_ROOT}/triton}"
