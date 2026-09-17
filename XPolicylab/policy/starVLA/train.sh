@@ -192,6 +192,19 @@ if expected_instruction_mapping is not None:
             "task instructions differ from the official EgoVLA mapping")
     require(instruction_contract.get("mapping_sha256") == expected_instruction_hash,
             "task instruction mapping hash is stale")
+    raw_provenance = manifest.get("raw_dataset_manifest")
+    require(isinstance(raw_provenance, dict),
+            "raw_dataset_manifest provenance is missing")
+    if isinstance(raw_provenance, dict):
+        raw_manifest_path = Path(str(raw_provenance.get("path", "")))
+        require(raw_manifest_path.is_file(),
+                f"raw dataset manifest is missing: {raw_manifest_path}")
+        if raw_manifest_path.is_file():
+            raw_bytes = raw_manifest_path.read_bytes()
+            require(raw_provenance.get("size_bytes") == len(raw_bytes),
+                    "raw dataset manifest size changed since conversion")
+            require(raw_provenance.get("sha256") == hashlib.sha256(raw_bytes).hexdigest(),
+                    "raw dataset manifest SHA256 changed since conversion")
 
 expected_short_names = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
 require(list(modality.get("video", {})) == expected_short_names,
