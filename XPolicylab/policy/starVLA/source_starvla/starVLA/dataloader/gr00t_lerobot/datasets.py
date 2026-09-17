@@ -1580,6 +1580,25 @@ class LeRobotSingleDataset(Dataset):
         elif self._lerobot_version == "v3.0":
             episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
 
+            # This repository's v3 metadata stores one explicit locator per
+            # camera (``videos/<key>/chunk_index`` and ``file_index``).  Do
+            # not fall back to the episode's data file index: all episodes
+            # share ``data/file-000.parquet`` while their videos have distinct
+            # file indices.  The nested ``videos/file_indices`` form remains
+            # supported for upstream LeRobot metadata.
+            per_camera_prefix = f"videos/{original_key}"
+            camera_chunk_column = f"{per_camera_prefix}/chunk_index"
+            camera_file_column = f"{per_camera_prefix}/file_index"
+            if camera_chunk_column in episode_meta and camera_file_column in episode_meta:
+                video_chunk_index = int(episode_meta[camera_chunk_column])
+                video_file_index = int(episode_meta[camera_file_column])
+                video_filename = self.video_path_pattern.format(
+                    video_key=original_key,
+                    chunk_index=video_chunk_index,
+                    file_index=video_file_index,
+                )
+                return self.dataset_path / video_filename
+
             video_file_indices = episode_meta.get("videos/file_indices", {})
             # print(f"{video_file_indices=}")
             # Modified lerobot v3.0 video index

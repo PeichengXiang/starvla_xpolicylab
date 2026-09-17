@@ -241,6 +241,8 @@ with open(src, "r", encoding="utf-8") as fp:
 dataset_path = os.path.realpath(dataset_path)
 with open(os.path.join(dataset_path, "conversion_manifest.json"), "r", encoding="utf-8") as fp:
     manifest = json.load(fp)
+with open(os.path.join(dataset_path, "conversion_manifest.json"), "rb") as fp:
+    conversion_manifest_sha256 = hashlib.sha256(fp.read()).hexdigest()
 with open(os.path.join(dataset_path, "meta", "modality.json"), "r", encoding="utf-8") as fp:
     modality = json.load(fp)
 
@@ -252,6 +254,9 @@ cfg["framework"]["qwenvl"]["base_vlm"] = base_vlm
 vla_data_cfg = cfg.setdefault("datasets", {}).setdefault("vla_data", {})
 vla_data_cfg["data_root_dir"] = data_root_dir
 vla_data_cfg["data_mix"] = data_mix
+vla_data_cfg["dataset_path"] = dataset_path
+vla_data_cfg["conversion_manifest_sha256"] = conversion_manifest_sha256
+vla_data_cfg["raw_dataset_manifest"] = manifest.get("raw_dataset_manifest")
 vla_data_cfg["action_mode"] = "abs"
 vla_data_cfg["action_source"] = "raw_hdf5_action"
 vla_data_cfg["action_temporal_offset"] = 0
@@ -305,6 +310,104 @@ cfg["framework"]["action_model"]["state_dim"] = dim
 
 with open(dst, "w", encoding="utf-8") as fp:
     yaml.safe_dump(cfg, fp, sort_keys=False)
+PY
+
+"${POLICY_PYTHON}" - \
+    "${config_yaml}" \
+    "${num_processes}" \
+    "${ACCELERATE_GRADIENT_ACCUMULATION_STEPS:-1}" \
+    "${STARVLA_EXPECTED_GLOBAL_BATCH_SIZE:-}" \
+    "$@" <<'PY'
+import sys
+
+import yaml
+
+
+config_path = sys.argv[1]
+num_processes_raw = sys.argv[2]
+accelerate_accumulation_raw = sys.argv[3]
+expected_global_batch_raw = sys.argv[4]
+extra_args = sys.argv[5:]
+
+
+def positive_int(value, name):
+    if isinstance(value, bool):
+        raise SystemExit(f"[starVLA][ERROR] {name} must be a positive integer, got {value!r}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"[starVLA][ERROR] {name} must be a positive integer, got {value!r}"
+        ) from None
+    if parsed <= 0:
+        raise SystemExit(f"[starVLA][ERROR] {name} must be positive, got {parsed}")
+    return parsed
+
+
+def normalize_dotlist_args(args):
+    normalized = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg.startswith("--"):
+            key = arg.lstrip("-")
+            if "=" in key:
+                normalized.append(key)
+            elif index + 1 < len(args) and not args[index + 1].startswith("--"):
+                normalized.append(f"{key}={args[index + 1]}")
+                index += 1
+            else:
+                normalized.append(f"{key}=true")
+        index += 1
+    return normalized
+
+
+with open(config_path, "r", encoding="utf-8") as stream:
+    config = yaml.safe_load(stream)
+
+per_device_batch = config["datasets"]["vla_data"]["per_device_batch_size"]
+trainer_accumulation = config["trainer"]["gradient_accumulation_steps"]
+for item in normalize_dotlist_args(extra_args):
+    key, raw_value = item.split("=", 1)
+    value = yaml.safe_load(raw_value)
+    if key == "datasets.vla_data.per_device_batch_size":
+        per_device_batch = value
+    elif key == "trainer.gradient_accumulation_steps":
+        trainer_accumulation = value
+
+per_device_batch = positive_int(per_device_batch, "per-device batch size")
+num_processes = positive_int(num_processes_raw, "number of training processes")
+trainer_accumulation = positive_int(
+    trainer_accumulation, "trainer.gradient_accumulation_steps"
+)
+accelerate_accumulation = positive_int(
+    accelerate_accumulation_raw, "ACCELERATE_GRADIENT_ACCUMULATION_STEPS"
+)
+if trainer_accumulation != accelerate_accumulation:
+    raise SystemExit(
+        "[starVLA][ERROR] Gradient-accumulation contract failed: "
+        f"trainer={trainer_accumulation}, Accelerate/DeepSpeed={accelerate_accumulation}. "
+        "Set trainer.gradient_accumulation_steps and "
+        "ACCELERATE_GRADIENT_ACCUMULATION_STEPS to the same value."
+    )
+
+global_batch = per_device_batch * num_processes * accelerate_accumulation
+if expected_global_batch_raw:
+    expected_global_batch = positive_int(
+        expected_global_batch_raw, "STARVLA_EXPECTED_GLOBAL_BATCH_SIZE"
+    )
+    if global_batch != expected_global_batch:
+        raise SystemExit(
+            "[starVLA][ERROR] Global batch-size contract failed: "
+            f"per_device={per_device_batch}, processes={num_processes}, "
+            f"gradient_accumulation={accelerate_accumulation}, "
+            f"resolved={global_batch}, expected={expected_global_batch}"
+        )
+
+print(
+    "[starVLA] global batch contract verified: "
+    f"{per_device_batch} x {num_processes} x {accelerate_accumulation} = {global_batch}"
+)
 PY
 
 echo "[starVLA] config_yaml=${config_yaml}"

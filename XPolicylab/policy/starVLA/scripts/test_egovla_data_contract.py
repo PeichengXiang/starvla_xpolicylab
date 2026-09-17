@@ -30,6 +30,16 @@ def _load_converter():
     return module
 
 
+def _load_upgrader():
+    path = WORKSPACE_ROOT / "data_scripts" / "upgrade_existing_dataset.py"
+    spec = importlib.util.spec_from_file_location("xpolicy_starvla_upgrader", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load dataset upgrader from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class EgoVLAConversionContractTest(unittest.TestCase):
     def test_raw_action_and_black_wrist_contract(self):
         converter = _load_converter()
@@ -38,6 +48,9 @@ class EgoVLAConversionContractTest(unittest.TestCase):
             task_dir = root / "raw" / "Close-Drawer"
             task_dir.mkdir(parents=True)
             source_path = task_dir / "episode_0.hdf5"
+            (task_dir.parent / "DATASET_MANIFEST.json").write_text(
+                '{"synthetic": true}\n', encoding="utf-8"
+            )
 
             steps = 4
             qpos = np.arange(steps * 50, dtype=np.float32).reshape(steps, 50)
@@ -71,6 +84,12 @@ class EgoVLAConversionContractTest(unittest.TestCase):
                 manifest["image_contract"]["black_camera_keys"],
                 converter.CAMERA_KEYS[1:],
             )
+            instruction_contract = manifest["instruction_contract"]
+            self.assertEqual(instruction_contract["mapping"], converter.EGO_TASK_INSTRUCTIONS)
+            self.assertEqual(
+                instruction_contract["mapping_sha256"],
+                converter.mapping_sha256(converter.EGO_TASK_INSTRUCTIONS),
+            )
 
             for camera_key in converter.CAMERA_KEYS:
                 video_path = output / "videos" / camera_key / "chunk-000/file-000.mp4"
@@ -81,6 +100,20 @@ class EgoVLAConversionContractTest(unittest.TestCase):
                 self.assertEqual(frame.shape, (224, 224, 3))
                 if camera_key != converter.CAMERA_KEYS[0]:
                     self.assertEqual(int(frame.max()), 0)
+
+    def test_upgrade_manifest_uses_the_same_canonical_prompt_hash(self):
+        upgrader = _load_upgrader()
+        manifest = upgrader.build_manifest(
+            {}, "egovla", Path("/source/dataset"), {"scope": "test"}
+        )
+        instruction_contract = upgrader.ego_instruction_contract()
+        self.assertEqual(manifest["instruction_contract"], instruction_contract)
+
+        from XPolicyLab.policy.starVLA.model import _egovla_task_instruction_contract
+
+        runtime_mapping, runtime_hash = _egovla_task_instruction_contract()
+        self.assertEqual(instruction_contract["mapping"], runtime_mapping)
+        self.assertEqual(instruction_contract["mapping_sha256"], runtime_hash)
 
 
 class EgoVLAInferenceContractTest(unittest.TestCase):
@@ -108,11 +141,15 @@ class EgoVLAInferenceContractTest(unittest.TestCase):
         self.assertEqual(int(converted["image"][2].max()), 0)
 
     def test_server_metadata_must_match_training_data_contract(self):
-        from XPolicyLab.policy.starVLA.model import _expected_xpolicylab_schema
+        from XPolicyLab.policy.starVLA.model import (
+            _egovla_task_instruction_contract,
+            _expected_xpolicylab_schema,
+        )
         from XPolicyLab.policy.starVLA.runtime_config import (
             validate_server_runtime_contract,
         )
 
+        _, instruction_mapping_sha256 = _egovla_task_instruction_contract()
         data_contract = {
             "action_mode": "abs",
             "action_source": "raw_hdf5_action",
@@ -122,6 +159,7 @@ class EgoVLAInferenceContractTest(unittest.TestCase):
             "black_camera_names": ["cam_left_wrist", "cam_right_wrist"],
             "image_size": [224, 224],
             "include_state": True,
+            "instruction_mapping_sha256": instruction_mapping_sha256,
             **_expected_xpolicylab_schema("ego_h1_inspire"),
         }
         metadata = {
@@ -162,6 +200,17 @@ class EgoVLAInferenceContractTest(unittest.TestCase):
             reversed(data_contract["xpolicylab_schema"]["action"])
         )
         with self.assertRaisesRegex(ValueError, "xpolicylab_schema"):
+            validate_server_runtime_contract(
+                metadata,
+                include_state=True,
+                action_dim=38,
+                unnorm_key=None,
+                expected_data_contract=data_contract,
+            )
+
+        metadata["training_data_contract"] = dict(data_contract)
+        metadata["training_data_contract"]["instruction_mapping_sha256"] = "stale"
+        with self.assertRaisesRegex(ValueError, "instruction_mapping_sha256"):
             validate_server_runtime_contract(
                 metadata,
                 include_state=True,

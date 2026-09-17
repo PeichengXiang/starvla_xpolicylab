@@ -41,10 +41,32 @@ SPARK_COMPONENTS = (
     "right_arm_joint_states",
     "right_ee_joint_states",
 )
+EGO_TASK_INSTRUCTION_PATH = Path(__file__).with_name(
+    "egovla_task_instructions.json"
+)
 
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def canonical_mapping_sha256(mapping: dict[str, str]) -> str:
+    payload = json.dumps(
+        mapping,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def ego_instruction_contract() -> dict:
+    mapping = load_json(EGO_TASK_INSTRUCTION_PATH)
+    return {
+        "source": "EgoVLA official LANGUAGE_MAPPING",
+        "mapping": mapping,
+        "mapping_sha256": canonical_mapping_sha256(mapping),
+    }
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -353,6 +375,7 @@ def build_manifest(
         image_decode = (
             "existing cam_high RGB MP4 retained; wrist streams are constant-black uint8 RGB"
         )
+        instruction_contract = ego_instruction_contract()
     else:
         kind = "spark"
         action_dim = 54
@@ -371,6 +394,7 @@ def build_manifest(
         image_decode = (
             "existing legacy SPark videos retained; decoded RGB order verified against raw HDF5"
         )
+        instruction_contract = {"source": "raw_hdf5_instruction"}
 
     manifest = copy.deepcopy(old_manifest)
     manifest.update(
@@ -394,6 +418,7 @@ def build_manifest(
                 "black_camera_keys": black_camera_keys,
             },
             "image_decode": image_decode,
+            "instruction_contract": instruction_contract,
             "source_is_external": True,
             "upgrade_provenance": {
                 "method": "reuse_existing_lerobot_dataset",
@@ -418,6 +443,13 @@ def validate_stage(stage: Path, benchmark: str) -> None:
         raise ValueError("Staged manifest is not contract v2")
     if manifest.get("camera_keys") != CAMERA_KEYS:
         raise ValueError("Staged camera order is incorrect")
+    expected_instruction_contract = (
+        ego_instruction_contract()
+        if benchmark == "egovla"
+        else {"source": "raw_hdf5_instruction"}
+    )
+    if manifest.get("instruction_contract") != expected_instruction_contract:
+        raise ValueError("Staged instruction contract is incorrect")
     if list(modality.get("video", {})) != ["cam_high", "cam_left_wrist", "cam_right_wrist"]:
         raise ValueError("Staged modality camera order is incorrect")
     for camera in CAMERA_KEYS:

@@ -288,6 +288,50 @@ class VLATrainer(TrainerUtils):
         OmegaConf.save(full_cfg, full_yaml_path, resolve=True)
         logger.info(f"📝 Full config saved at {full_yaml_path}")
 
+        # The model server must be able to reject an inference client whose
+        # action/camera/prompt contract differs from training.  Keep this
+        # small, human-readable sidecar next to the complete config rather
+        # than relying on the compact accessed-only snapshot.
+        plain_cfg = OmegaConf.to_container(full_cfg, resolve=True)
+        vla_cfg = (plain_cfg or {}).get("datasets", {}).get("vla_data", {})
+        schema = vla_cfg.get("xpolicylab_schema")
+        if isinstance(schema, dict) and schema.get("robot_type") in {
+            "xpolicylab_egovla",
+            "xpolicylab_sparkarena",
+        }:
+            contract = {
+                "contract_version": 2,
+                "robot_type": schema["robot_type"],
+                "action_dim": int(plain_cfg["framework"]["action_model"]["action_dim"]),
+                "state_dim": int(plain_cfg["framework"]["action_model"]["state_dim"]),
+                "action_mode": vla_cfg.get("action_mode"),
+                "action_source": vla_cfg.get("action_source"),
+                "action_temporal_offset": vla_cfg.get("action_temporal_offset"),
+                "action_derived_from_state": vla_cfg.get("action_derived_from_state"),
+                "camera_names": vla_cfg.get("camera_names"),
+                "black_camera_names": vla_cfg.get("black_camera_names"),
+                "image_size": vla_cfg.get("obs_image_size") or vla_cfg.get("image_size"),
+                "include_state": vla_cfg.get("include_state"),
+                "instruction_mapping_sha256": vla_cfg.get("instruction_mapping_sha256"),
+                "conversion_manifest_sha256": vla_cfg.get("conversion_manifest_sha256"),
+                "raw_dataset_manifest": vla_cfg.get("raw_dataset_manifest"),
+                "xpolicylab_schema": schema,
+            }
+            contract_name = (
+                "egovla_contract.json"
+                if schema["robot_type"] == "xpolicylab_egovla"
+                else "sparkarena_contract.json"
+            )
+            contract_path = output_dir / contract_name
+            temporary = contract_path.with_name(f".{contract_path.name}.tmp")
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(contract, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, contract_path)
+            logger.info(f"📜 Training contract saved at {contract_path}")
+
         # 2. Save config.yaml — accessed-only snapshot (will be updated at checkpoints)
         if isinstance(self.config, AccessTrackedConfig):
             self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)

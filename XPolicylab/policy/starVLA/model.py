@@ -281,8 +281,9 @@ class Model(ModelTemplate):
             instruction = instruction[0] if instruction else ""
         if instruction in (None, ""):
             instruction = self.model_cfg.get("task_name", "")
-        if self.egovla_task_instructions is not None:
-            expected_instructions = set(self.egovla_task_instructions.values())
+        egovla_task_instructions = getattr(self, "egovla_task_instructions", None)
+        if egovla_task_instructions is not None:
+            expected_instructions = set(egovla_task_instructions.values())
             if str(instruction) not in expected_instructions:
                 raise ValueError(
                     "EgoVLA instruction does not exactly match the official registry: "
