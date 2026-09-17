@@ -25,7 +25,7 @@ export WANDB_REQUIRE_ONLINE=1
 export WANDB_ENTITY="${WANDB_ENTITY:-peichengxiang773-hkust}"
 export WANDB_PROJECT="${WANDB_PROJECT:-starvla-xpolicylab}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-export ACCELERATE_GRADIENT_ACCUMULATION_STEPS=1
+export ACCELERATE_GRADIENT_ACCUMULATION_STEPS=4
 export ACCELERATE_DEEPSPEED_ZERO_STAGE=2
 unset ACCELERATE_DEEPSPEED_ZERO3_INIT ACCELERATE_DEEPSPEED_ZERO3_SAVE_16BIT_MODEL
 export STARVLA_EXPECTED_GLOBAL_BATCH_SIZE=64
@@ -34,9 +34,9 @@ export PYTHONUNBUFFERED=1
 
 exec bash "${ROOT_DIR}/XPolicylab/policy/starVLA/train.sh" \
   EgoVLA full_v2 ego_h1_inspire joint 0 \
-  0,1,2,3,4,5,6,7 \
-  --datasets.vla_data.per_device_batch_size=8 \
+  0,1,2,3 \
+  --datasets.vla_data.per_device_batch_size=4 \
   --trainer.max_train_steps=80000 \
   --trainer.save_interval=10000 \
   --trainer.eval_interval=10000 \
-  --trainer.gradient_accumulation_steps=1
+  --trainer.gradient_accumulation_steps=4
