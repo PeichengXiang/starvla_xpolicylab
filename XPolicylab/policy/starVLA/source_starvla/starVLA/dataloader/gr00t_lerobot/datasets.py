@@ -56,6 +56,7 @@ from functools import partial
 from typing import Tuple, List
 import pickle
 import gc
+import time
 
 # LeRobot v2.0 dataset file names 
 LE_ROBOT_MODALITY_FILENAME = "meta/modality.json"
@@ -952,7 +953,6 @@ class LeRobotSingleDataset(Dataset):
                                 "chunk_index": int(episode[chunk_col]),
                                 "file_index": int(episode[file_col]),
                             }
-                    print(video_file_indices)
                     episode_meta = {
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],
@@ -1019,11 +1019,30 @@ class LeRobotSingleDataset(Dataset):
     
             print(f"[RANK 0] Cached steps saved to {steps_path}")
     
-        # ---------- sync after rank0  ----------
-        if dist.is_initialized():
-            dist.barrier()
-    
-        # ---------- read by all rank ----------
+        # Do not wait for a slow, rank-0-only cache build inside an NCCL
+        # collective.  Large datasets can take longer than the process-group
+        # watchdog timeout, which aborts the waiting ranks before rank 0 can
+        # publish the cache.  The writer uses os.replace(), so other ranks can
+        # safely poll for and load the atomically published file instead.
+        if dist.is_initialized() and not is_main():
+            wait_timeout = float(
+                os.environ.get("STARVLA_STEPS_CACHE_WAIT_TIMEOUT_SECONDS", "3600")
+            )
+            deadline = time.monotonic() + wait_timeout
+            while True:
+                try:
+                    with open(steps_path, "rb") as f:
+                        cached_data = pickle.load(f)
+                    return cached_data["steps"]
+                except (FileNotFoundError, EOFError, pickle.PickleError, KeyError):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out after {wait_timeout:g}s waiting for rank 0 "
+                            f"to publish {steps_path}"
+                        )
+                    time.sleep(1.0)
+
+        # ---------- read by rank0 / non-distributed callers ----------
         with open(steps_path, "rb") as f:
             cached_data = pickle.load(f)
     
