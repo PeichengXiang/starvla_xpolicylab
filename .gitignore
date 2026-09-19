@@ -1,4 +1,5 @@
 .venv*
+.cache/
 data/
 pretrain_model/
 checkpoints/
