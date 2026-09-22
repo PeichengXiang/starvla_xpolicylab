@@ -50,7 +50,33 @@ if [[ ! -x "${POLICY_PYTHON}" ]]; then POLICY_PYTHON="${STARVLA_PYTHON:-python}"
 base_config_yaml="${SCRIPT_DIR}/qwen_pi_v3.yaml"
 data_dir_name="${bench_name}-${ckpt_name}-${env_cfg_type}-${action_type}"
 run_id="${data_dir_name}-${seed}"
-num_processes=$(awk -F',' '{print NF}' <<< "${gpu_id}")
+local_num_processes=$(awk -F',' '{print NF}' <<< "${gpu_id}")
+num_machines=${ACCELERATE_NUM_MACHINES:-1}
+machine_rank=${ACCELERATE_MACHINE_RANK:-0}
+num_processes=${ACCELERATE_NUM_PROCESSES:-$((local_num_processes * num_machines))}
+main_process_ip=${ACCELERATE_MAIN_PROCESS_IP:-}
+main_process_port=${ACCELERATE_MAIN_PROCESS_PORT:-29500}
+
+for value_name in local_num_processes num_machines num_processes main_process_port; do
+    value=${!value_name}
+    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[starVLA][ERROR] ${value_name} must be a positive integer, got: ${value}" >&2
+        exit 2
+    fi
+done
+if [[ ! "${machine_rank}" =~ ^[0-9]+$ ]] || (( machine_rank >= num_machines )); then
+    echo "[starVLA][ERROR] machine_rank must be in [0, $((num_machines - 1))], got: ${machine_rank}" >&2
+    exit 2
+fi
+if (( num_processes != local_num_processes * num_machines )); then
+    echo "[starVLA][ERROR] Total process count must equal local GPUs x machines: " \
+         "${num_processes} != ${local_num_processes} x ${num_machines}" >&2
+    exit 2
+fi
+if (( num_machines > 1 )) && [[ -z "${main_process_ip}" ]]; then
+    echo "[starVLA][ERROR] ACCELERATE_MAIN_PROCESS_IP is required for multi-node training" >&2
+    exit 2
+fi
 data_root_dir="${STARVLA_DATA_ROOT:-${SCRIPT_DIR}/../../../data}"
 base_vlm="${STARVLA_BASE_VLM:-${SCRIPT_DIR}/../../../pretrain_model/Qwen3-VL-4B-Instruct}"
 if [[ ! -d "${data_root_dir}" ]]; then
@@ -68,7 +94,9 @@ fi
 base_vlm="$(cd "${base_vlm}" && pwd -P)"
 data_mix="${STARVLA_DATA_MIX:-xpolicylab_runtime}"
 dataset_name="${STARVLA_XPOLICY_DATASET_NAME:-${data_dir_name}}"
-config_yaml="${SCRIPT_DIR}/.generated/qwen_pi_v3_${run_id}.yaml"
+config_suffix=""
+if (( num_machines > 1 )); then config_suffix=".rank${machine_rank}"; fi
+config_yaml="${SCRIPT_DIR}/.generated/qwen_pi_v3_${run_id}${config_suffix}.yaml"
 dataset_path="${data_root_dir}/${dataset_name}"
 task_instruction_path="${SCRIPT_DIR}/../../../data_scripts/egovla_task_instructions.json"
 if [[ "${bench_name}" == "SParkRealBenchV5" || "${bench_name}" == "spark_real_bench_v5" ]]; then
@@ -459,7 +487,8 @@ echo "[starVLA] data_root_dir=${data_root_dir}"
 echo "[starVLA] data_mix=${data_mix}, dataset=${dataset_name}, dataset_path=${dataset_path}"
 echo "[starVLA] base_vlm=${base_vlm}"
 echo "[starVLA] train_entry=starVLA/training/train_starvla.py"
-echo "[starVLA] num_processes=${num_processes}, mixed_precision=bf16"
+echo "[starVLA] local_processes=${local_num_processes}, total_processes=${num_processes}, " \
+     "num_machines=${num_machines}, machine_rank=${machine_rank}, mixed_precision=bf16"
 
 if [[ "${STARVLA_PREFLIGHT_ONLY:-0}" == "1" ]]; then
     echo "[starVLA] preflight-only validation complete; training was not started"
@@ -467,6 +496,19 @@ if [[ "${STARVLA_PREFLIGHT_ONLY:-0}" == "1" ]]; then
 fi
 
 cd "${STARVLA_ROOT}"
+accelerate_launch_args=(
+    --num_processes "${num_processes}"
+    --num_machines "${num_machines}"
+    --machine_rank "${machine_rank}"
+    --mixed_precision bf16
+    --dynamo_backend no
+)
+if (( num_machines > 1 )); then
+    accelerate_launch_args+=(
+        --main_process_ip "${main_process_ip}"
+        --main_process_port "${main_process_port}"
+    )
+fi
 PYTHONPATH="${STARVLA_ROOT}:${PYTHONPATH:-}" \
 STARVLA_XPOLICY_DATASET_NAME="${dataset_name}" \
 STARVLA_XPOLICY_DATA_MIX="${data_mix}" \
@@ -476,10 +518,7 @@ NO_ALBUMENTATIONS_UPDATE="${NO_ALBUMENTATIONS_UPDATE:-1}" \
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
 TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}" \
 CUDA_VISIBLE_DEVICES="${gpu_id}" "${POLICY_PYTHON}" -m accelerate.commands.accelerate_cli launch \
-    --num_processes "${num_processes}" \
-    --num_machines 1 \
-    --mixed_precision bf16 \
-    --dynamo_backend no \
+    "${accelerate_launch_args[@]}" \
     starVLA/training/train_starvla.py \
     --config_yaml "${config_yaml}" \
     --run_id "${run_id}" \
