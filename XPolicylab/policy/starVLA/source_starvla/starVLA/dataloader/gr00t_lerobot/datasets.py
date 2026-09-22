@@ -960,6 +960,21 @@ class LeRobotSingleDataset(Dataset):
                         "videos/from_timestamps": from_timestamps,
                         "videos/file_indices": video_file_indices,
                     }
+                    # LeRobot v3 already records each episode's resolved task
+                    # strings in the compact episode metadata.  Keep them here
+                    # so step-index construction can validate language without
+                    # reopening a (potentially very large) frame parquet once
+                    # per episode.
+                    raw_tasks = episode.get("tasks", None)
+                    if raw_tasks is not None:
+                        if isinstance(raw_tasks, np.ndarray):
+                            episode_meta["tasks"] = raw_tasks.tolist()
+                        elif isinstance(raw_tasks, (list, tuple)):
+                            episode_meta["tasks"] = list(raw_tasks)
+                        elif pd.isna(raw_tasks):
+                            episode_meta["tasks"] = []
+                        else:
+                            episode_meta["tasks"] = [raw_tasks]
                     # episode_meta = {
                     #     "data/chunk_index": episode["data/chunk_index"],
                     #     "data/file_index": episode["data/file_index"],
@@ -983,13 +998,23 @@ class LeRobotSingleDataset(Dataset):
         config_key = self._get_steps_config_key()
         steps_filename = "steps_data_index.pkl"
         steps_path = self.dataset_path / "meta" / steps_filename
+
+        def load_cached_steps() -> list[tuple[int, int]]:
+            with open(steps_path, "rb") as f:
+                cached_data = pickle.load(f)
+            steps = cached_data["steps"]
+            if cached_data.get("config_key") != config_key:
+                raise KeyError("step cache configuration changed")
+            if cached_data.get("num_trajectories") != len(self.trajectory_ids):
+                raise KeyError("step cache trajectory count changed")
+            if cached_data.get("total_steps") != len(steps):
+                raise KeyError("step cache length is inconsistent")
+            return steps
     
         # ---------- try to read from cache  ----------
         if steps_path.exists():
             try:
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
+                return load_cached_steps()
             except Exception as e:
                 # include EOFError / PickleError / KeyError
                 print(
@@ -1031,9 +1056,7 @@ class LeRobotSingleDataset(Dataset):
             deadline = time.monotonic() + wait_timeout
             while True:
                 try:
-                    with open(steps_path, "rb") as f:
-                        cached_data = pickle.load(f)
-                    return cached_data["steps"]
+                    return load_cached_steps()
                 except (FileNotFoundError, EOFError, pickle.PickleError, KeyError):
                     if time.monotonic() >= deadline:
                         raise TimeoutError(
@@ -1043,16 +1066,16 @@ class LeRobotSingleDataset(Dataset):
                     time.sleep(1.0)
 
         # ---------- read by rank0 / non-distributed callers ----------
-        with open(steps_path, "rb") as f:
-            cached_data = pickle.load(f)
-    
-        return cached_data["steps"]
+        return load_cached_steps()
 
     def _get_steps_config_key(self) -> str:
         """Generate a configuration key for steps caching."""
         config_dict = {
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
+            "trajectory_signature": hashlib.sha256(
+                self.trajectory_ids.tobytes() + self.trajectory_lengths.tobytes()
+            ).hexdigest(),
         }
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
@@ -1069,20 +1092,35 @@ class LeRobotSingleDataset(Dataset):
         has_language_modality = 'language' in self.modality_keys and len(self.modality_keys['language']) > 0
         # TODO why trajectory_length here, why not use data length?
         for trajectory_id, trajectory_length in tqdm(zip(self.trajectory_ids, self.trajectory_lengths), total=len(self.trajectory_ids), desc="Getting All Step"):
+            trajectory_skipped = False
             try:
-                if self._lerobot_version == "v2.0":
-                    data = self.get_trajectory_data(trajectory_id)
-                elif self._lerobot_version == "v3.0":
-                    data = self.get_trajectory_data_lerobot_v3(trajectory_id)
-                
-                trajectory_skipped = False
-            
                 # Check if trajectory has valid language instruction (if language modality is configured)
                 if has_language_modality:
-                    self.curr_traj_data = data  # Set current trajectory data for get_language to work
+                    episode_tasks = None
+                    if self._lerobot_version == "v3.0":
+                        episode_tasks = self.trajectory_ids_to_metadata.get(
+                            trajectory_id, {}
+                        ).get("tasks")
 
-                    language_instruction = self.get_language(trajectory_id, self.modality_keys['language'][0], 0)
-                    if not language_instruction or language_instruction[0] == "":
+                    if episode_tasks is not None:
+                        has_valid_language = any(
+                            isinstance(task, str) and bool(task.strip())
+                            for task in episode_tasks
+                        )
+                    else:
+                        if self._lerobot_version == "v2.0":
+                            data = self.get_trajectory_data(trajectory_id)
+                        elif self._lerobot_version == "v3.0":
+                            data = self.get_trajectory_data_lerobot_v3(trajectory_id)
+                        self.curr_traj_data = data
+                        language_instruction = self.get_language(
+                            trajectory_id, self.modality_keys['language'][0], 0
+                        )
+                        has_valid_language = bool(
+                            language_instruction and language_instruction[0].strip()
+                        )
+
+                    if not has_valid_language:
                         print(f"Skipping trajectory {trajectory_id} due to empty language instruction")
                         skipped_trajectories += 1
                         trajectory_skipped = True
