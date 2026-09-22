@@ -10,13 +10,20 @@ case "$bench_name" in
   SParkArena|spark|SparkArena)
     [[ "$env_cfg_type" == "tianji_marvin_wuji" ]] || { echo "SParkArena requires env_cfg_type=tianji_marvin_wuji" >&2; exit 2; }
     mode=spark; source="$ROOT_DIR/data/raw_sources/SParkArena";;
+  SParkRealBenchV5|spark_real_bench_v5)
+    [[ "$env_cfg_type" == "tianji_marvin_wuji" ]] || { echo "SParkRealBenchV5 requires env_cfg_type=tianji_marvin_wuji" >&2; exit 2; }
+    mode=spark_real_bench_v5
+    source="${STARVLA_SPARK_REAL_RAW_ROOT:-$ROOT_DIR/data/raw_sources/SParkRealBenchV5}";;
   EgoVLA|egovla)
     [[ "$env_cfg_type" == "ego_h1_inspire" ]] || { echo "EgoVLA requires env_cfg_type=ego_h1_inspire" >&2; exit 2; }
     mode=egovla; source="${STARVLA_EGOVLA_RAW_ROOT:-$ROOT_DIR/data/raw_sources/EgoVLA}";;
-  *) echo "Unsupported benchmark: $bench_name (use SParkArena or EgoVLA)" >&2; exit 2;;
+  *) echo "Unsupported benchmark: $bench_name (use SParkArena, SParkRealBenchV5, or EgoVLA)" >&2; exit 2;;
 esac
 [[ "$action_type" == "joint" ]] || { echo "This converter reads HDF5 joint-state action keys; use action_type=joint" >&2; exit 2; }
 out="$ROOT_DIR/data/${bench_name}-${ckpt_name}-${env_cfg_type}-${action_type}"
 args=("$mode" --source "$source" --output "$out")
+if [[ "$mode" == "spark_real_bench_v5" ]]; then
+  args+=(--workers "${STARVLA_CONVERT_WORKERS:-4}")
+fi
 [[ -n "$limit" ]] && args+=(--limit "$limit")
 exec "${POLICY_PYTHON}" "$ROOT_DIR/data_scripts/convert_dataset.py" "${args[@]}"

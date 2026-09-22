@@ -34,8 +34,8 @@ for extra_arg in "$@"; do
 done
 
 case "${bench_name}:${env_cfg_type}" in
-    SParkArena:tianji_marvin_wuji|spark:tianji_marvin_wuji|SparkArena:tianji_marvin_wuji|EgoVLA:ego_h1_inspire|egovla:ego_h1_inspire) ;;
-    *) echo "[starVLA][ERROR] Use SParkArena/tianji_marvin_wuji or EgoVLA/ego_h1_inspire" >&2; exit 2;;
+    SParkArena:tianji_marvin_wuji|spark:tianji_marvin_wuji|SparkArena:tianji_marvin_wuji|SParkRealBenchV5:tianji_marvin_wuji|spark_real_bench_v5:tianji_marvin_wuji|EgoVLA:ego_h1_inspire|egovla:ego_h1_inspire) ;;
+    *) echo "[starVLA][ERROR] Use SParkArena or SParkRealBenchV5 with tianji_marvin_wuji, or EgoVLA/ego_h1_inspire" >&2; exit 2;;
 esac
 if [[ "${action_type}" != "joint" ]]; then
     echo "[starVLA][ERROR] This HDF5 conversion uses joint-state action keys; action_type must be joint" >&2
@@ -71,6 +71,9 @@ dataset_name="${STARVLA_XPOLICY_DATASET_NAME:-${data_dir_name}}"
 config_yaml="${SCRIPT_DIR}/.generated/qwen_pi_v3_${run_id}.yaml"
 dataset_path="${data_root_dir}/${dataset_name}"
 task_instruction_path="${SCRIPT_DIR}/../../../data_scripts/egovla_task_instructions.json"
+if [[ "${bench_name}" == "SParkRealBenchV5" || "${bench_name}" == "spark_real_bench_v5" ]]; then
+    task_instruction_path="${SCRIPT_DIR}/../../../data_scripts/spark_real_bench_v5_task_instructions.json"
+fi
 robot_type="xpolicylab_sparkarena"
 if [[ "${env_cfg_type}" == "ego_h1_inspire" ]]; then robot_type="xpolicylab_egovla"; fi
 
@@ -86,7 +89,7 @@ if [[ ! -f "${dataset_path}/meta/modality.json" ]]; then
     exit 1
 fi
 
-"${POLICY_PYTHON}" - "${dataset_path}" "${robot_type}" "${task_instruction_path}" <<'PY'
+"${POLICY_PYTHON}" - "${dataset_path}" "${robot_type}" "${task_instruction_path}" "${bench_name}" <<'PY'
 import hashlib
 import json
 import sys
@@ -95,6 +98,7 @@ from pathlib import Path
 dataset_path = Path(sys.argv[1])
 robot_type = sys.argv[2]
 task_instruction_path = Path(sys.argv[3])
+bench_name = sys.argv[4]
 manifest_path = dataset_path / "conversion_manifest.json"
 if not manifest_path.is_file():
     raise SystemExit(f"[starVLA][ERROR] Dataset has no source manifest: {manifest_path}. Re-run process_data.sh.")
@@ -139,7 +143,8 @@ if robot_type == "xpolicylab_egovla":
     expected_instruction_hash = hashlib.sha256(instruction_payload).hexdigest()
 else:
     expected_dim = 54
-    expected_kind = "spark"
+    is_spark_real = bench_name in {"SParkRealBenchV5", "spark_real_bench_v5"}
+    expected_kind = "spark_real_bench_v5" if is_spark_real else "spark"
     expected_video = {
         camera_keys[0]: "vision/cam_head/colors",
         camera_keys[1]: "vision/cam_left_wrist/colors",
@@ -151,8 +156,20 @@ else:
     ]
     expected_black = []
     expected_indices = None
-    expected_instruction_mapping = None
-    expected_instruction_hash = None
+    expected_instruction_mapping = (
+        json.loads(task_instruction_path.read_text(encoding="utf-8"))
+        if is_spark_real else None
+    )
+    if expected_instruction_mapping is None:
+        expected_instruction_hash = None
+    else:
+        instruction_payload = json.dumps(
+            expected_instruction_mapping,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        expected_instruction_hash = hashlib.sha256(instruction_payload).hexdigest()
     expected_groups = [
         ("left_arm", 0, 7), ("left_ee", 7, 27),
         ("right_arm", 27, 34), ("right_ee", 34, 54),
@@ -189,7 +206,7 @@ require(image_contract.get("black_camera_keys") == expected_black,
 if expected_instruction_mapping is not None:
     instruction_contract = manifest.get("instruction_contract", {})
     require(instruction_contract.get("mapping") == expected_instruction_mapping,
-            "task instructions differ from the official EgoVLA mapping")
+            "task instructions differ from the benchmark mapping")
     require(instruction_contract.get("mapping_sha256") == expected_instruction_hash,
             "task instruction mapping hash is stale")
     raw_provenance = manifest.get("raw_dataset_manifest")
@@ -205,6 +222,17 @@ if expected_instruction_mapping is not None:
                     "raw dataset manifest size changed since conversion")
             require(raw_provenance.get("sha256") == hashlib.sha256(raw_bytes).hexdigest(),
                     "raw dataset manifest SHA256 changed since conversion")
+if expected_kind == "spark_real_bench_v5":
+    upstream = manifest.get("upstream_action_contract", {})
+    arm = upstream.get("arm", {})
+    hand = upstream.get("hand", {})
+    require(arm.get("semantics") == "state[t+1], terminal hold-last",
+            "real-bench arm labels must retain the canonical next-state contract")
+    hand_delta = hand.get("verified_not_next_state_max_abs", {})
+    require(
+        all(float(hand_delta.get(side, 0.0)) > 0.0 for side in ("left", "right")),
+        "real-bench hand labels must be canonical master actions, not state[t+1]",
+    )
 
 expected_short_names = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
 require(list(modality.get("video", {})) == expected_short_names,

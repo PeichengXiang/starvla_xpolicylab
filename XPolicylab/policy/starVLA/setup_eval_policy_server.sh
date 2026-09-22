@@ -33,7 +33,11 @@ case "${env_cfg_type}" in
         starvla_default_unnorm_key="auto"
         ;;
     tianji_marvin_wuji)
-        yaml_file="${SCRIPT_DIR}/deploy_sparkarena.yml"
+        if [[ "${bench_name}" == "SParkRealBenchV5" || "${bench_name}" == "spark_real_bench_v5" ]]; then
+            yaml_file="${SCRIPT_DIR}/deploy_spark_real_bench_v5.yml"
+        else
+            yaml_file="${SCRIPT_DIR}/deploy_sparkarena.yml"
+        fi
         starvla_robot_type="xpolicylab_sparkarena"
         starvla_default_unnorm_key="auto"
         ;;

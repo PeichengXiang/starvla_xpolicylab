@@ -1,5 +1,6 @@
 from __future__ import annotations
-import argparse, hashlib, json, os, shutil, sys
+import argparse, hashlib, json, multiprocessing, os, shutil, sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 import cv2, h5py, numpy as np, pandas as pd
 from tqdm import tqdm
@@ -22,6 +23,12 @@ CAMERA_KEYS = [
 EGO_TASK_INSTRUCTIONS = json.loads(
     Path(__file__).with_name('egovla_task_instructions.json').read_text(encoding='utf-8')
 )
+SPARK_REAL_TASK_INSTRUCTIONS = json.loads(
+    Path(__file__).with_name('spark_real_bench_v5_task_instructions.json').read_text(
+        encoding='utf-8'
+    )
+)
+SPARK_KINDS = {'spark', 'spark_real_bench_v5'}
 
 def mapping_sha256(mapping):
     payload=json.dumps(mapping,sort_keys=True,separators=(',',':'),ensure_ascii=False)
@@ -30,7 +37,7 @@ def mapping_sha256(mapping):
 def path_lexists(path):
     return os.path.lexists(path)
 
-def ego_stage_path(out):
+def stage_path(out):
     return out.parent / f'.{out.name}.staging'
 
 def file_sha256(path, chunk_size=16 * 1024 * 1024):
@@ -54,6 +61,55 @@ def raw_dataset_manifest_provenance(source):
         'size_bytes': int(after.st_size),
         'sha256': sha256,
     }
+
+def spark_real_manifest_provenance(source, episode_count, limited):
+    path=Path(source) / 'conversion_manifest.json'
+    if not path.is_file():
+        raise FileNotFoundError(f'SParkRealBenchV5 source manifest not found: {path}')
+    before=path.stat(); raw=path.read_bytes(); after=path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f'SParkRealBenchV5 source manifest changed while reading: {path}')
+    payload=json.loads(raw)
+    expected_policy=(
+        'hand_master_aligned_causal_then_camera_keep;',
+        'arm_future_state:1_after_camera_keep_hold_last',
+    )
+    action_policy=str(payload.get('action_policy',''))
+    errors=[]
+    if payload.get('schema') != 'spark0_raw_directory_canonical_manifest_v1':
+        errors.append('unexpected source manifest schema')
+    if payload.get('task_instructions') != SPARK_REAL_TASK_INSTRUCTIONS:
+        errors.append('task instruction mapping differs from SParkRealBenchV5 registry')
+    if any(token not in action_policy for token in expected_policy):
+        errors.append('action_policy does not describe master-hand actions plus arm next-state labels')
+    if not limited and int(payload.get('episode_count',-1)) != episode_count:
+        errors.append(
+            f"episode_count={payload.get('episode_count')!r} does not match discovered {episode_count}"
+        )
+    if errors:
+        raise ValueError(f'{path}: ' + '; '.join(errors))
+    return {
+        'path': str(path.resolve()),
+        'size_bytes': int(after.st_size),
+        'sha256': hashlib.sha256(raw).hexdigest(),
+        'schema': payload['schema'],
+        'action_policy': action_policy,
+        'episode_count': int(payload['episode_count']),
+    }
+
+def h5_text(handle, key):
+    value=handle[key][()]
+    if isinstance(value,(bytes,np.bytes_)):
+        return bytes(value).decode(errors='replace')
+    return str(value)
+
+def update_max_abs(current, lhs, rhs, label):
+    delta=np.asarray(lhs,dtype=np.float64)-np.asarray(rhs,dtype=np.float64)
+    if delta.size == 0:
+        return current
+    if not np.isfinite(delta).all():
+        raise ValueError(f'{label}: non-finite action/state comparison')
+    return max(current,float(np.max(np.abs(delta))))
 
 def link_or_copy(source, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -114,21 +170,66 @@ def write_video(frames, path, fps):
             writer.write(cv2.cvtColor(image,cv2.COLOR_RGB2BGR))
     finally: writer.release()
 
+def write_spark_episode_videos(source_path, output_root, episode_index, fps, frame_count):
+    """Stream one Spark episode into its three videos without retaining RGB frames."""
+    cv2.setNumThreads(1)
+    source_path=Path(source_path); output_root=Path(output_root)
+    camera_pairs=zip(
+        CAMERA_KEYS,
+        ('cam_head','cam_left_wrist','cam_right_wrist'),
+    )
+    with h5py.File(source_path,'r') as handle:
+        for key,camera in camera_pairs:
+            dataset=handle[f'vision/{camera}/colors']
+            if len(dataset) != frame_count:
+                raise ValueError(
+                    f'{source_path}: vision/{camera}/colors has {len(dataset)} rows, '
+                    f'expected {frame_count}'
+                )
+            final=(
+                output_root/'videos'/key/'chunk-000'/f'file-{episode_index:03d}.mp4'
+            )
+            temporary=final.with_name(
+                f'.{final.stem}.{os.getpid()}.tmp.mp4'
+            )
+            if path_lexists(final) or path_lexists(temporary):
+                raise FileExistsError(f'Refusing to overwrite video: {final}')
+            try:
+                write_video(
+                    (decode_image_bit(dataset[index]) for index in range(frame_count)),
+                    temporary,
+                    fps,
+                )
+                if not temporary.is_file() or temporary.stat().st_size <= 0:
+                    raise RuntimeError(f'VideoWriter produced an empty file: {temporary}')
+                os.replace(temporary,final)
+            finally:
+                if path_lexists(temporary):
+                    temporary.unlink()
+
 def write_black_video(path, frame_count, fps):
     black=np.zeros((IMAGE_HEIGHT,IMAGE_WIDTH,3),dtype=np.uint8)
     write_video((black for _ in range(frame_count)),path,fps)
 
-def convert_spark(source,out,limit=None,keep=False):
+def convert_spark(source,out,limit=None,keep=False,workers=1):
     paths=sorted(Path(source).glob('*/tianji_marvin_wuji/data/episode_*.hdf5'))
-    return convert(paths,out,'spark',limit,keep,source=source)
+    return convert(paths,out,'spark',limit,keep,source=source,workers=workers)
 
-def convert_ego(source,out,limit=None,keep=False):
+def convert_spark_real(source,out,limit=None,keep=False,workers=1):
     paths=[]
     for task in sorted(Path(source).glob('*')):
         if task.is_dir(): paths += sorted(task.glob('episode_*.hdf5'))
-    return convert(paths,out,'ego',limit,keep,source=source)
+    return convert(
+        paths,out,'spark_real_bench_v5',limit,keep,source=source,workers=workers
+    )
 
-def convert(paths,out,kind,limit,keep,source=None):
+def convert_ego(source,out,limit=None,keep=False,workers=1):
+    paths=[]
+    for task in sorted(Path(source).glob('*')):
+        if task.is_dir(): paths += sorted(task.glob('episode_*.hdf5'))
+    return convert(paths,out,'ego',limit,keep,source=source,workers=workers)
+
+def convert(paths,out,kind,limit,keep,source=None,workers=1):
     if keep:
         raise ValueError('--keep-existing is incompatible with fail-closed conversion')
     if limit: paths=paths[:limit]
@@ -137,14 +238,15 @@ def convert(paths,out,kind,limit,keep,source=None):
     if path_lexists(final):
         raise FileExistsError(f'Refusing to overwrite existing output: {final}')
 
-    raw_manifest=(
-        raw_dataset_manifest_provenance(source)
-        if kind == 'ego'
-        else None
-    )
-    final.parent.mkdir(parents=True,exist_ok=True)
+    raw_manifest=None
     if kind == 'ego':
-        stage=ego_stage_path(final)
+        raw_manifest=raw_dataset_manifest_provenance(source)
+    elif kind == 'spark_real_bench_v5':
+        raw_manifest=spark_real_manifest_provenance(source,len(paths),limit is not None)
+    final.parent.mkdir(parents=True,exist_ok=True)
+    atomic=kind in {'ego','spark_real_bench_v5'}
+    if atomic:
+        stage=stage_path(final)
         if path_lexists(stage):
             raise FileExistsError(f'Refusing to overwrite existing staging directory: {stage}')
         stage.mkdir()
@@ -154,32 +256,104 @@ def convert(paths,out,kind,limit,keep,source=None):
         out=final
 
     try:
-        episodes,frames,dim=_convert_into(paths,out,kind,raw_manifest)
-        if kind == 'ego':
+        episodes,frames,dim=_convert_into(paths,out,kind,raw_manifest,workers)
+        if atomic:
             if path_lexists(final):
                 raise FileExistsError(f'Output appeared during conversion; staging retained: {final}')
             os.replace(out,final)
     except Exception:
-        retained=out if kind == 'ego' else final
+        retained=out if atomic else final
         print(f'conversion failed; partial output retained for inspection: {retained}',file=sys.stderr)
         raise
     print(f'wrote {final}: episodes={episodes} frames={frames} action_dim={dim}')
 
-def _convert_into(paths,out,kind,raw_manifest):
+def _convert_into(paths,out,kind,raw_manifest,workers):
     (out/'data/chunk-000').mkdir(parents=True,exist_ok=True); (out/'meta/episodes/chunk-000').mkdir(parents=True,exist_ok=True)
-    rows=[]; erows=[]; task_map={}; total=0; fps=30
-    dim=54 if kind=='spark' else 38
+    rows=[]; erows=[]; task_map={}; total=0; fps=30; dataset_fps=None
+    dim=54 if kind in SPARK_KINDS else 38
     cams=CAMERA_KEYS
     black_templates={}
     black_template_dir=out/'.black-video-templates'
-    for ei,p in enumerate(tqdm(paths,desc=f'{kind} episodes')):
+    upstream_stats={
+        'nonterminal_rows': 0,
+        'arm_next_state_max_abs': {'left': 0.0, 'right': 0.0},
+        'arm_terminal_hold_max_abs': {'left': 0.0, 'right': 0.0},
+        'hand_next_state_max_abs': {'left': 0.0, 'right': 0.0},
+    }
+    video_executor=None
+    video_futures=[]
+    if kind in SPARK_KINDS and workers > 1:
+        video_executor=ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context('spawn'),
+        )
+    try:
+      for ei,p in enumerate(tqdm(paths,desc=f'{kind} episodes')):
         with h5py.File(p,'r') as f:
-            if kind=='spark':
+            if kind in SPARK_KINDS:
                 fps=int(np.asarray(f['additional_info/frequency']).item()) if 'additional_info/frequency' in f else 30
+                if dataset_fps is None:
+                    dataset_fps=fps
+                elif fps != dataset_fps:
+                    raise ValueError(
+                        f'{p}: fps={fps} differs from dataset fps={dataset_fps}'
+                    )
                 instruction=f['instruction'][()].decode(errors='replace') if 'instruction' in f and isinstance(f['instruction'][()],bytes) else (str(f['instruction'][()]) if 'instruction' in f else p.parent.parent.name.replace('_',' '))
-                state=np.concatenate([f['state/left_arm_joint_states'][()],f['state/left_ee_joint_states'][()],f['state/right_arm_joint_states'][()],f['state/right_ee_joint_states'][()]],axis=1).astype('float32')
-                action=np.concatenate([f['action/left_arm_joint_states'][()],f['action/left_ee_joint_states'][()],f['action/right_arm_joint_states'][()],f['action/right_ee_joint_states'][()]],axis=1).astype('float32')
-                frame_lists={k:[decode_image_bit(x) for x in f['vision'][cam]['colors'][:]] for k,cam in zip(cams,['cam_head','cam_left_wrist','cam_right_wrist'])}
+                state_parts={name:f[f'state/{name}'][()] for name in ('left_arm_joint_states','left_ee_joint_states','right_arm_joint_states','right_ee_joint_states')}
+                action_parts={name:f[f'action/{name}'][()] for name in ('left_arm_joint_states','left_ee_joint_states','right_arm_joint_states','right_ee_joint_states')}
+                state=np.concatenate(list(state_parts.values()),axis=1).astype('float32')
+                # Intentionally use canonical action[t] at the same row.  Arm labels
+                # are upstream next-state targets; hand labels are upstream aligned
+                # master commands.  This converter never constructs or shifts either.
+                action=np.concatenate(list(action_parts.values()),axis=1).astype('float32')
+                frame_lengths={
+                    key:len(f[f'vision/{camera}/colors'])
+                    for key,camera in zip(
+                        cams,('cam_head','cam_left_wrist','cam_right_wrist')
+                    )
+                }
+                if kind == 'spark_real_bench_v5':
+                    task=p.parent.name
+                    expected_instruction=SPARK_REAL_TASK_INSTRUCTIONS.get(task)
+                    if expected_instruction is None or instruction != expected_instruction:
+                        raise ValueError(
+                            f'{p}: instruction {instruction!r} does not match task {task!r}'
+                        )
+                    expected_metadata={
+                        'metadata/action_source': 'master_hand_aligned_causal_with_zero_state_policy',
+                        'metadata/arm_state_action_source': 'source_robot_joints',
+                        'metadata/ee_action_source': 'master_hand_aligned_causal_with_zero_state_policy',
+                    }
+                    for key,expected in expected_metadata.items():
+                        if key not in f or h5_text(f,key) != expected:
+                            actual=h5_text(f,key) if key in f else None
+                            raise ValueError(f'{p}: {key}={actual!r}, expected {expected!r}')
+                    for camera in ('cam_head','cam_left_wrist','cam_right_wrist'):
+                        group=f[f'vision/{camera}']
+                        if group.attrs.get('encoding') != 'jpeg' or group.attrs.get('color_order') != 'true_rgb':
+                            raise ValueError(
+                                f'{p}: vision/{camera} must declare jpeg true_rgb source pixels'
+                            )
+                    length=len(state)
+                    upstream_stats['nonterminal_rows'] += max(0,length-1)
+                    for side in ('left','right'):
+                        arm_state=state_parts[f'{side}_arm_joint_states']
+                        arm_action=action_parts[f'{side}_arm_joint_states']
+                        hand_state=state_parts[f'{side}_ee_joint_states']
+                        hand_action=action_parts[f'{side}_ee_joint_states']
+                        if length > 1:
+                            upstream_stats['arm_next_state_max_abs'][side]=update_max_abs(
+                                upstream_stats['arm_next_state_max_abs'][side],
+                                arm_action[:-1],arm_state[1:],f'{p}: {side} arm next-state',
+                            )
+                            upstream_stats['hand_next_state_max_abs'][side]=update_max_abs(
+                                upstream_stats['hand_next_state_max_abs'][side],
+                                hand_action[:-1],hand_state[1:],f'{p}: {side} hand next-state',
+                            )
+                        upstream_stats['arm_terminal_hold_max_abs'][side]=update_max_abs(
+                            upstream_stats['arm_terminal_hold_max_abs'][side],
+                            arm_action[-1],arm_state[-1],f'{p}: {side} arm terminal hold',
+                        )
             else:
                 task=p.parent.name; instruction=task_text(task); fps=30
                 q=f['observations/qpos'][()]; a=f['action'][()]
@@ -189,28 +363,65 @@ def _convert_into(paths,out,kind,raw_manifest):
                 frame_lists={
                     'observation.images.cam_high':[im for im in images],
                 }
-            lengths={'state':len(state),'action':len(action),**{key:len(frames) for key,frames in frame_lists.items()}}
+                frame_lengths={key:len(frames) for key,frames in frame_lists.items()}
+            lengths={'state':len(state),'action':len(action),**frame_lengths}
             if kind == 'ego':
                 lengths.update({key:len(images) for key in CAMERA_KEYS[1:]})
             if len(set(lengths.values())) != 1:
                 raise ValueError(f'{p}: unaligned source lengths would change action timing: {lengths}')
             length=len(state); task_idx=task_map.setdefault(instruction,len(task_map))
             video_meta={}
-            for key in cams:
-                vp=out/'videos'/key/'chunk-000'/f'file-{ei:03d}.mp4'
-                if key in frame_lists:
-                    write_video(frame_lists[key][:length],vp,fps)
+            if kind in SPARK_KINDS:
+                video_args=(str(p),str(out),ei,fps,length)
+                if video_executor is None:
+                    write_spark_episode_videos(*video_args)
                 else:
-                    template=black_templates.get(length)
-                    if template is None:
-                        template=black_template_dir/f'black-{length:06d}.mp4'
-                        write_black_video(template,length,fps)
-                        black_templates[length]=template
-                    link_or_copy(template,vp)
+                    video_futures.append(
+                        video_executor.submit(write_spark_episode_videos,*video_args)
+                    )
+            for key in cams:
+                if kind not in SPARK_KINDS:
+                    vp=out/'videos'/key/'chunk-000'/f'file-{ei:03d}.mp4'
+                    if key in frame_lists:
+                        write_video(frame_lists[key][:length],vp,fps)
+                    else:
+                        template=black_templates.get(length)
+                        if template is None:
+                            template=black_template_dir/f'black-{length:06d}.mp4'
+                            write_black_video(template,length,fps)
+                            black_templates[length]=template
+                        link_or_copy(template,vp)
                 video_meta[f'videos/{key}/from_timestamp']=0.0; video_meta[f'videos/{key}/chunk_index']=0; video_meta[f'videos/{key}/file_index']=ei
             for fi in range(length):
                 rows.append({'episode_index':ei,'frame_index':fi,'timestamp':fi/float(fps),'task_index':task_idx,'index':total+fi,'observation.state':state[fi],'action':action[fi]})
             erow={'episode_index':ei,'length':length,'tasks':[instruction],'data/chunk_index':0,'data/file_index':0,'data/file_from_index':total,'data/file_to_index':total+length,'dataset_from_index':total,'dataset_to_index':total+length}; erow.update(video_meta); erows.append(erow); total += length
+      for future in tqdm(video_futures,desc='spark videos'):
+          future.result()
+    except Exception:
+      for future in video_futures:
+          future.cancel()
+      raise
+    finally:
+      if video_executor is not None:
+          video_executor.shutdown(wait=True,cancel_futures=True)
+    if kind == 'spark_real_bench_v5':
+        if upstream_stats['nonterminal_rows'] <= 0:
+            raise ValueError('SParkRealBenchV5 has no non-terminal rows to verify')
+        for side in ('left','right'):
+            if upstream_stats['arm_next_state_max_abs'][side] != 0.0:
+                raise ValueError(
+                    f'SParkRealBenchV5 {side} arm action is not the declared next-state target: '
+                    f"max_abs={upstream_stats['arm_next_state_max_abs'][side]}"
+                )
+            if upstream_stats['arm_terminal_hold_max_abs'][side] != 0.0:
+                raise ValueError(
+                    f'SParkRealBenchV5 {side} arm terminal action is not hold-last state'
+                )
+            if upstream_stats['hand_next_state_max_abs'][side] == 0.0:
+                raise ValueError(
+                    f'SParkRealBenchV5 {side} hand action was replaced by state[t+1]; '
+                    'expected the canonical aligned master-hand action'
+                )
     for template in black_templates.values():
         template.unlink()
     if black_template_dir.exists():
@@ -218,7 +429,7 @@ def _convert_into(paths,out,kind,raw_manifest):
     pd.DataFrame(rows).to_parquet(out/'data/chunk-000/file-000.parquet',index=False)
     pd.DataFrame(erows).to_parquet(out/'meta/episodes/chunk-000/file-000.parquet',index=False)
     pd.DataFrame({'task_index':list(task_map.values())},index=list(task_map.keys())).to_parquet(out/'meta/tasks.parquet')
-    write_meta(out,dim,cams,len(erows),total,len(task_map),fps)
+    write_meta(out,dim,cams,len(erows),total,len(task_map),dataset_fps or fps)
     source_keys = ({
         'video': {
             'observation.images.cam_high': 'vision/cam_head/colors',
@@ -230,7 +441,7 @@ def _convert_into(paths,out,kind,raw_manifest):
         'action': ['action/left_arm_joint_states', 'action/left_ee_joint_states',
                    'action/right_arm_joint_states', 'action/right_ee_joint_states'],
         'language': 'instruction',
-    } if kind == 'spark' else {
+    } if kind in SPARK_KINDS else {
         'video': {
             'observation.images.cam_high': 'observations/images/main',
             'observation.images.cam_left_wrist': 'constant_black',
@@ -258,18 +469,36 @@ def _convert_into(paths,out,kind,raw_manifest):
             'width': IMAGE_WIDTH,
             'dtype': 'uint8',
             'color_order': 'rgb',
-            'black_camera_keys': [] if kind == 'spark' else CAMERA_KEYS[1:],
+            'black_camera_keys': [] if kind in SPARK_KINDS else CAMERA_KEYS[1:],
         },
-        'image_decode': 'XPolicyLab.utils.process_data.decode_image_bit (RGB)' if kind == 'spark' else 'decoded uint8 RGB array',
+        'image_decode': 'XPolicyLab.utils.process_data.decode_image_bit (RGB)' if kind in SPARK_KINDS else 'decoded uint8 RGB array',
         'instruction_contract': ({
             'source': 'EgoVLA official LANGUAGE_MAPPING',
             'mapping': EGO_TASK_INSTRUCTIONS,
             'mapping_sha256': mapping_sha256(EGO_TASK_INSTRUCTIONS),
         } if kind == 'ego' else {
+            'source': 'SParkRealBenchV5 canonical task registry',
+            'mapping': SPARK_REAL_TASK_INSTRUCTIONS,
+            'mapping_sha256': mapping_sha256(SPARK_REAL_TASK_INSTRUCTIONS),
+        } if kind == 'spark_real_bench_v5' else {
             'source': 'raw_hdf5_instruction',
         }),
         'source_is_external': True,
     }
+    if kind == 'spark_real_bench_v5':
+        conversion_manifest['upstream_action_contract']={
+            'arm': {
+                'source': 'canonical action/{left,right}_arm_joint_states',
+                'semantics': 'state[t+1], terminal hold-last',
+                'verified_max_abs_error': upstream_stats['arm_next_state_max_abs'],
+                'terminal_hold_max_abs_error': upstream_stats['arm_terminal_hold_max_abs'],
+            },
+            'hand': {
+                'source': 'canonical aligned master-hand action',
+                'semantics': 'use action[t] unchanged; never substitute state[t+1]',
+                'verified_not_next_state_max_abs': upstream_stats['hand_next_state_max_abs'],
+            },
+        }
     if raw_manifest is not None:
         conversion_manifest['raw_dataset_manifest']=raw_manifest
     (out/'conversion_manifest.json').write_text(
@@ -278,6 +507,9 @@ def _convert_into(paths,out,kind,raw_manifest):
     return len(erows),total,dim
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('benchmark',choices=['spark','egovla']); ap.add_argument('--source',required=True); ap.add_argument('--output',required=True); ap.add_argument('--limit',type=int); ap.add_argument('--keep-existing',action='store_true'); a=ap.parse_args()
-    (convert_spark if a.benchmark=='spark' else convert_ego)(a.source,a.output,a.limit,a.keep_existing)
+    ap=argparse.ArgumentParser(); ap.add_argument('benchmark',choices=['spark','spark_real_bench_v5','egovla']); ap.add_argument('--source',required=True); ap.add_argument('--output',required=True); ap.add_argument('--limit',type=int); ap.add_argument('--keep-existing',action='store_true'); ap.add_argument('--workers',type=int,default=1); a=ap.parse_args()
+    if a.workers <= 0:
+        ap.error('--workers must be positive')
+    converter={'spark':convert_spark,'spark_real_bench_v5':convert_spark_real,'egovla':convert_ego}[a.benchmark]
+    converter(a.source,a.output,a.limit,a.keep_existing,a.workers)
 if __name__=='__main__': main()

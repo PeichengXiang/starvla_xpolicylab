@@ -26,8 +26,8 @@ from .runtime_config import (
 _CUR_DIR = Path(__file__).resolve().parent
 
 
-def _egovla_task_instruction_contract() -> tuple[dict[str, str], str]:
-    path = _CUR_DIR.parents[2] / "data_scripts" / "egovla_task_instructions.json"
+def _task_instruction_contract(filename: str) -> tuple[dict[str, str], str]:
+    path = _CUR_DIR.parents[2] / "data_scripts" / filename
     mapping = json.loads(path.read_text(encoding="utf-8"))
     payload = json.dumps(
         mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -210,7 +210,17 @@ class Model(ModelTemplate):
             (
                 self.egovla_task_instructions,
                 self.instruction_mapping_sha256,
-            ) = _egovla_task_instruction_contract()
+            ) = _task_instruction_contract("egovla_task_instructions.json")
+        elif self.model_cfg.get("bench_name") in {
+            "SParkRealBenchV5",
+            "spark_real_bench_v5",
+        }:
+            (
+                self.egovla_task_instructions,
+                self.instruction_mapping_sha256,
+            ) = _task_instruction_contract(
+                "spark_real_bench_v5_task_instructions.json"
+            )
         self.include_state = resolve_include_state(
             self.model_cfg.get("include_state", "auto"),
             self.model_cfg.get("checkpoint_path"),
@@ -286,7 +296,7 @@ class Model(ModelTemplate):
             expected_instructions = set(egovla_task_instructions.values())
             if str(instruction) not in expected_instructions:
                 raise ValueError(
-                    "EgoVLA instruction does not exactly match the official registry: "
+                    "Instruction does not exactly match the checkpoint's benchmark registry: "
                     f"{instruction!r}"
                 )
 
