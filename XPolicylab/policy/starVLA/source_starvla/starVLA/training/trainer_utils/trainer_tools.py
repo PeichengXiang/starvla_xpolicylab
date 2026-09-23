@@ -510,11 +510,17 @@ class TrainerUtils:
             return None, 0
 
         # Find all checkpoints matching the naming convention, supports .pt and .safetensors
-        checkpoints = [
-            f for f in os.listdir(checkpoint_dir) 
-            if re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", f)
-            and os.path.isfile(os.path.join(checkpoint_dir, f))  # ensure it is a file
-        ]
+        checkpoints = []
+        for filename in os.listdir(checkpoint_dir):
+            if not re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", filename):
+                continue
+            path = os.path.join(checkpoint_dir, filename)
+            # A failed shared-filesystem write can leave a zero-byte file with a
+            # valid-looking name.  Never select it as a resume point.
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                checkpoints.append(filename)
+            elif os.path.exists(path):
+                self.accelerator.print(f"Skipping incomplete checkpoint: {path}")
 
         if not checkpoints:
             self.accelerator.print(f"No checkpoints found in {checkpoint_dir}")

@@ -14,6 +14,7 @@ Conventions:
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Tuple
@@ -392,13 +393,16 @@ class VLATrainer(TrainerUtils):
 
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
+                checkpoint_suffix = "_model.safetensors"
             elif save_format == "pt":
-                torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+                checkpoint_suffix = "_pytorch_model.pt"
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            self._save_state_dict_reliably(
+                state_dict,
+                checkpoint_path + checkpoint_suffix,
+                save_format,
+            )
 
             summary_data = {"steps": self.completed_steps}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
@@ -412,6 +416,83 @@ class VLATrainer(TrainerUtils):
                 logger.info("✅ Configuration files saved")
 
         self.accelerator.wait_for_everyone()
+
+    def _save_state_dict_reliably(self, state_dict, target_path, save_format):
+        """Stage locally, verify, and atomically install a checkpoint on GPFS.
+
+        A direct ``torch.save`` to the shared filesystem previously left a zero-byte
+        checkpoint after a transient GPFS write error and then terminated the job.
+        Rank 0 can stage on local NVMe (via ``STARVLA_CHECKPOINT_STAGING_DIR``),
+        retry the serialization/copy up to three times, and only expose a complete
+        file with an atomic rename.
+        """
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging_root = os.environ.get("STARVLA_CHECKPOINT_STAGING_DIR")
+        if staging_root:
+            staging_root = Path(staging_root)
+            staging_root.mkdir(parents=True, exist_ok=True)
+        else:
+            staging_root = target.parent
+
+        stage_final = staging_root / target.name
+        stage_tmp = staging_root / f".{target.name}.tmp.{os.getpid()}"
+        target_tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
+
+        for attempt in range(1, 4):
+            try:
+                for path in (stage_tmp, target_tmp):
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+                if save_format == "safetensors":
+                    from safetensors.torch import save_file
+
+                    save_file(state_dict, str(stage_tmp))
+                else:
+                    torch.save(state_dict, str(stage_tmp))
+
+                # Ensure the local staged serialization is complete before copying.
+                with stage_tmp.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                staged_size = stage_tmp.stat().st_size
+                if staged_size <= 0:
+                    raise OSError(f"staged checkpoint is empty: {stage_tmp}")
+                os.replace(stage_tmp, stage_final)
+
+                # Do not expose a partial file on the shared filesystem.
+                shutil.copyfile(stage_final, target_tmp)
+                with target_tmp.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                target_size = target_tmp.stat().st_size
+                if target_size != staged_size:
+                    raise OSError(
+                        f"checkpoint copy size mismatch: staged={staged_size}, target={target_size}"
+                    )
+                os.replace(target_tmp, target)
+                logger.info(
+                    "Checkpoint serialized and atomically installed: %s (%d bytes)",
+                    target,
+                    target_size,
+                )
+                return
+            except Exception as exc:
+                for path in (stage_tmp, target_tmp):
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                if attempt >= 3:
+                    raise
+                logger.warning(
+                    "Checkpoint write attempt %d/3 failed for %s: %s; retrying",
+                    attempt,
+                    target,
+                    exc,
+                )
+                time.sleep(10 * attempt)
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
@@ -606,13 +687,16 @@ class VLATrainer(TrainerUtils):
             os.makedirs(final_checkpoint, exist_ok=True)
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
+                final_name = "model.safetensors"
             elif save_format == "pt":
-                torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+                final_name = "pytorch_model.pt"
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            self._save_state_dict_reliably(
+                state_dict,
+                os.path.join(final_checkpoint, final_name),
+                save_format,
+            )
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         finish_failed = False
