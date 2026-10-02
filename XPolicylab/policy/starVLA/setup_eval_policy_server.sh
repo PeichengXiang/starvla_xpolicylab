@@ -22,6 +22,10 @@ XPL_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BENCH_ROOT="$(cd "${XPL_ROOT}/.." && pwd)"
 UTILS_DIR="${XPL_ROOT}/utils"
 STARVLA_ROOT="${SCRIPT_DIR}/source_starvla"
+# The policy conda env installs another XPolicyLab. This checkout must win so
+# the EE adapter next to the checkpoint is the one that serves actions.
+REPO_ROOT="$(cd "${XPL_ROOT}/.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 policy_name="$(basename "${SCRIPT_DIR}")"
 starvla_registry_env=()
