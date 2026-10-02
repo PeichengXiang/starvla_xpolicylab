@@ -223,6 +223,7 @@ PY
         "STARVLA_XPOLICY_DATASET_NAME=${STARVLA_XPOLICY_DATASET_NAME:-checkpoint_runtime}"
         "STARVLA_XPOLICY_DATA_MIX=${saved_data_mix}"
         "STARVLA_XPOLICY_ROBOT_TYPE=${starvla_robot_type}"
+        "STARVLA_XPOLICY_ACTION_TYPE=${action_type}"
     )
     echo "[SERVER] checkpoint registry: data_mix=${saved_data_mix}, robot_type=${starvla_robot_type}"
 fi
