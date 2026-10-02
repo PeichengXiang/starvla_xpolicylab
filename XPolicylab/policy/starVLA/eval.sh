@@ -37,6 +37,49 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Eval Web runs the policy on an A800 and Isaac on a render node.
+component="${EGOVLA_COMPONENT:-}"
+if [[ -n "${component}" ]]; then
+    policy_server_host="${EGOVLA_POLICY_SERVER_HOST:?policy server host is required}"
+    policy_server_port="${EGOVLA_POLICY_SERVER_PORT:?policy server port is required}"
+    if [[ ! "${policy_server_port}" =~ ^[0-9]+$ ]] || (( policy_server_port < 1 || policy_server_port > 65535 )); then
+        echo "[MAIN][ERROR] invalid policy server port" >&2
+        exit 2
+    fi
+    case "${component}" in
+        policy)
+            echo "[MAIN] split starVLA server GPU=${policy_gpu_id}, bind=${policy_server_host}:${policy_server_port}"
+            exec bash "${SERVER_SCRIPT}" \
+                "${bench_name}" "${task_name}" "${ckpt_name}" "${env_cfg_type}" \
+                "${action_type}" "${seed}" "${policy_gpu_id}" "${policy_conda_env}" \
+                "${policy_server_port}" "${policy_server_host}"
+            ;;
+        environment)
+            echo "[MAIN] split starVLA client GPU=${env_gpu_id}, server=${policy_server_host}:${policy_server_port}"
+            ready=0
+            for (( attempt=0; attempt<600; attempt++ )); do
+                if timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "${policy_server_host}" "${policy_server_port}" 2>/dev/null; then
+                    ready=1
+                    break
+                fi
+                sleep 2
+            done
+            if [[ "${ready}" != "1" ]]; then
+                echo "[MAIN][ERROR] remote starVLA policy server did not become ready" >&2
+                exit 1
+            fi
+            exec bash "${CLIENT_SCRIPT}" \
+                "${bench_name}" "${task_name}" "${ckpt_name}" "${env_cfg_type}" \
+                "${action_type}" "${seed}" "${env_gpu_id}" "${eval_env_conda_env}" \
+                "${additional_info}" "${policy_server_port}" "${policy_server_host}"
+            ;;
+        *)
+            echo "[MAIN][ERROR] unsupported starVLA component: ${component}" >&2
+            exit 2
+            ;;
+    esac
+fi
+
 echo "[MAIN] start starVLA server, policy_server_port=${policy_server_port}"
 
 bash "${SERVER_SCRIPT}" \
@@ -71,3 +114,4 @@ bash "${CLIENT_SCRIPT}" \
     "${policy_server_host}"
 
 echo "[MAIN] eval finished"
+
