@@ -35,12 +35,17 @@ def _task_instruction_contract(filename: str) -> tuple[dict[str, str], str]:
     return mapping, hashlib.sha256(payload).hexdigest()
 
 
-def _expected_xpolicylab_schema(env_cfg_type: str) -> dict[str, Any]:
+def _expected_xpolicylab_schema(env_cfg_type: str, action_type: str = "joint") -> dict[str, Any]:
     if env_cfg_type == "ego_h1_inspire":
         robot_type = "xpolicylab_egovla"
-        dims = [7, 12, 7, 12]
-        source_action_keys: Any = "action"
-        source_indices = [
+        dims = [9, 12, 9, 12] if action_type == "ee" else [7, 12, 7, 12]
+        source_action_keys: Any = (
+            [
+                "observations/left_target_ee_pose", "action (left hand indices)",
+                "observations/right_target_ee_pose", "action (right hand indices)",
+            ] if action_type == "ee" else "action"
+        )
+        source_indices = None if action_type == "ee" else [
             [4, 8, 12, 16, 20, 22, 24],
             [26, 36, 27, 37, 28, 38, 29, 39, 30, 40, 46, 48],
             [5, 9, 13, 17, 21, 23, 25],
@@ -48,18 +53,24 @@ def _expected_xpolicylab_schema(env_cfg_type: str) -> dict[str, Any]:
         ]
     elif env_cfg_type == "tianji_marvin_wuji":
         robot_type = "xpolicylab_sparkarena"
-        dims = [7, 20, 7, 20]
-        source_action_keys = [
-            "action/left_arm_joint_states",
-            "action/left_ee_joint_states",
-            "action/right_arm_joint_states",
-            "action/right_ee_joint_states",
-        ]
+        dims = [9, 20, 9, 20] if action_type == "ee" else [7, 20, 7, 20]
+        source_action_keys = (
+            [
+                "action/left_ee_poses", "action/left_ee_joint_states",
+                "action/right_ee_poses", "action/right_ee_joint_states",
+            ] if action_type == "ee" else [
+                "action/left_arm_joint_states", "action/left_ee_joint_states",
+                "action/right_arm_joint_states", "action/right_ee_joint_states",
+            ]
+        )
         source_indices = None
     else:
         raise ValueError(f"No XPolicy data schema for env_cfg_type={env_cfg_type!r}.")
 
-    names = ["left_arm", "left_ee", "right_arm", "right_ee"]
+    names = (
+        ["left_ee_pose", "left_hand", "right_ee_pose", "right_hand"]
+        if action_type == "ee" else ["left_arm", "left_ee", "right_arm", "right_ee"]
+    )
     state_entries = [
         {"key": f"state.{name}", "dim": dim}
         for name, dim in zip(names, dims)
@@ -80,6 +91,10 @@ def _expected_xpolicylab_schema(env_cfg_type: str) -> dict[str, Any]:
         "xpolicylab_schema": {
             "version": 1,
             "robot_type": robot_type,
+            "action_type": action_type,
+            "pose_format": "abs_xyz_rot6d" if action_type == "ee" else None,
+            "raw_action_dim": sum([7, 12, 7, 12] if env_cfg_type == "ego_h1_inspire" else [7, 20, 7, 20]),
+            "model_action_dim": sum(dims),
             "normalization_mode": "q99",
             "state_dtype": "float16",
             "state": state_entries,
@@ -88,6 +103,78 @@ def _expected_xpolicylab_schema(env_cfg_type: str) -> dict[str, Any]:
             "source_action_keys": source_action_keys,
         },
     }
+
+
+def _pose7_to_rot6d(pose):
+    pose = np.asarray(pose, dtype=np.float32)
+    xyz = pose[..., :3]
+    q = pose[..., 3:7]
+    norm = np.linalg.norm(q, axis=-1, keepdims=True)
+    if np.any(norm < 1e-8):
+        raise ValueError("EE pose contains a zero quaternion")
+    q = q / norm
+    w, x, y, z = [q[..., i] for i in range(4)]
+    rot6d = np.stack([
+        1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w),
+        2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w),
+    ], axis=-1)
+    return np.concatenate([xyz, rot6d], axis=-1)
+
+
+def _rot6d_to_pose7(pose):
+    pose = np.asarray(pose, dtype=np.float32)
+    xyz = pose[..., :3]
+    r0 = pose[..., 3:6]
+    r1 = pose[..., 6:9]
+    r0 = r0 / np.maximum(np.linalg.norm(r0, axis=-1, keepdims=True), 1e-8)
+    r1 = r1 - np.sum(r1 * r0, axis=-1, keepdims=True) * r0
+    r1 = r1 / np.maximum(np.linalg.norm(r1, axis=-1, keepdims=True), 1e-8)
+    r2 = np.cross(r0, r1)
+    matrix = np.stack([r0, r1, r2], axis=-2)
+    flat = matrix.reshape(-1, 3, 3)
+    quats = np.empty((len(flat), 4), dtype=np.float32)
+    for i, m in enumerate(flat):
+        trace = float(np.trace(m))
+        if trace > 0.0:
+            s = np.sqrt(trace + 1.0) * 2.0
+            q = np.array([(m[2,1]-m[1,2])/s, (m[0,2]-m[2,0])/s,
+                          (m[1,0]-m[0,1])/s, 0.25*s], dtype=np.float32)
+        elif m[0,0] > m[1,1] and m[0,0] > m[2,2]:
+            s = np.sqrt(max(1.0 + m[0,0] - m[1,1] - m[2,2], 1e-8)) * 2.0
+            q = np.array([ (m[2,1]-m[1,2])/s, 0.25*s,
+                           (m[0,1]+m[1,0])/s, (m[0,2]+m[2,0])/s], dtype=np.float32)
+        elif m[1,1] > m[2,2]:
+            s = np.sqrt(max(1.0 + m[1,1] - m[0,0] - m[2,2], 1e-8)) * 2.0
+            q = np.array([ (m[0,2]-m[2,0])/s, (m[0,1]+m[1,0])/s,
+                           0.25*s, (m[1,2]+m[2,1])/s], dtype=np.float32)
+        else:
+            s = np.sqrt(max(1.0 + m[2,2] - m[0,0] - m[1,1], 1e-8)) * 2.0
+            q = np.array([ (m[1,0]-m[0,1])/s, (m[0,2]+m[2,0])/s,
+                           (m[1,2]+m[2,1])/s, 0.25*s], dtype=np.float32)
+        # The branch formulas above produce (qx, qy, qz, qw); the XPolicyLab
+        # runtime contract is explicitly (qw, qx, qy, qz).
+        q = np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
+        quats[i] = q / max(float(np.linalg.norm(q)), 1e-8)
+    return np.concatenate([xyz, quats.reshape(matrix.shape[:-2] + (4,))], axis=-1)
+
+
+def _convert_packed_pose(vector, robot_action_dim_info, to_model):
+    """Convert packed raw EE pose7 vectors to model pose9, or back."""
+    vector = np.asarray(vector, dtype=np.float32)
+    arm_dims = list(robot_action_dim_info["arm_dim"])
+    hand_dims = list(robot_action_dim_info["ee_dim"])
+    parts = []
+    offset = 0
+    for arm_dim, hand_dim in zip(arm_dims, hand_dims):
+        input_pose_dim = 7 if to_model else 9
+        raw_pose = vector[..., offset:offset+input_pose_dim]
+        if raw_pose.shape[-1] != input_pose_dim:
+            raise ValueError(f"EE runtime pose width must be 7, got {raw_pose.shape}")
+        parts.append(_pose7_to_rot6d(raw_pose) if to_model else _rot6d_to_pose7(raw_pose))
+        offset += input_pose_dim
+        parts.append(vector[..., offset:offset+hand_dim])
+        offset += hand_dim
+    return np.concatenate(parts, axis=-1)
 
 
 def _optional_path(value: str | None, *base_dirs: Path) -> Path | None:
@@ -142,15 +229,20 @@ class Model(ModelTemplate):
     def __init__(self, model_cfg):
         self.model_cfg = dict(model_cfg)
         self.action_type = self.model_cfg.get("action_type", "joint")
-        if self.action_type != "joint":
-            raise ValueError("starVLA currently supports action_type='joint' first.")
+        if self.action_type not in {"joint", "ee"}:
+            raise ValueError("starVLA action_type must be 'joint' or 'ee'.")
 
         self.env_cfg_type = self.model_cfg.get("env_cfg_type")
         if self.env_cfg_type is None:
             raise ValueError("starVLA requires env_cfg_type.")
         self.robot_action_dim_info = get_robot_action_dim_info(self.env_cfg_type)
-        self.action_dim = sum(self.robot_action_dim_info["arm_dim"]) + sum(
+        self.raw_action_dim = sum(self.robot_action_dim_info["arm_dim"]) + sum(
             self.robot_action_dim_info["ee_dim"]
+        )
+        self.action_dim = (
+            sum(9 for _ in self.robot_action_dim_info["arm_dim"])
+            + sum(self.robot_action_dim_info["ee_dim"])
+            if self.action_type == "ee" else self.raw_action_dim
         )
 
         starvla_root = _optional_path(
@@ -182,7 +274,9 @@ class Model(ModelTemplate):
         if self.unnorm_key in (None, "", "null", "None", "auto"):
             self.unnorm_key = None
         self.use_ddim = bool(self.model_cfg.get("use_ddim", True))
-        self.num_ddim_steps = int(self.model_cfg.get("num_ddim_steps", 10))
+        # QwenPI_v3 uses the LayerwiseFM sampler; keep the legacy request
+        # field aligned with the checkpoint's four-step inference setting.
+        self.num_ddim_steps = int(self.model_cfg.get("num_ddim_steps", 4))
         self.image_size = tuple(int(value) for value in self.model_cfg.get("image_size", [224, 224]))
         if len(self.image_size) != 2 or any(value <= 0 for value in self.image_size):
             raise ValueError(f"image_size must be [height, width], got {self.image_size!r}.")
@@ -241,7 +335,7 @@ class Model(ModelTemplate):
             if self.env_cfg_type in {"ego_h1_inspire", "tianji_marvin_wuji"}:
                 expected_data_contract = {
                     "action_mode": "abs",
-                    "action_source": "raw_hdf5_action",
+                    "action_source": "raw_hdf5_action_same_timestep",
                     "action_temporal_offset": 0,
                     "action_derived_from_state": False,
                     "camera_names": self.camera_names,
@@ -249,7 +343,9 @@ class Model(ModelTemplate):
                     "image_size": list(self.image_size),
                     "include_state": self.include_state,
                     "instruction_mapping_sha256": self.instruction_mapping_sha256,
-                    **_expected_xpolicylab_schema(self.env_cfg_type),
+                    **_expected_xpolicylab_schema(self.env_cfg_type, self.action_type),
+                    "action_type": self.action_type,
+                    "pose_format": "abs_xyz_rot6d" if self.action_type == "ee" else None,
                 }
             validate_server_runtime_contract(
                 server_meta,
@@ -311,6 +407,8 @@ class Model(ModelTemplate):
                 self.robot_action_dim_info,
                 source_type="obs",
             ).astype(np.float32)
+            if self.action_type == "ee":
+                state = _convert_packed_pose(state, self.robot_action_dim_info, to_model=True)
             if state.ndim == 1:
                 state = state[None, :]
             if state.ndim != 2 or state.shape[-1] != self.action_dim:
@@ -360,6 +458,8 @@ class Model(ModelTemplate):
         action = np.asarray(chunk[action_idx], dtype=np.float32)
         if action.shape[-1] != self.action_dim:
             raise ValueError(f"Expected action dim {self.action_dim}, got {action.shape[-1]}.")
+        if self.action_type == "ee":
+            action = _convert_packed_pose(action, self.robot_action_dim_info, to_model=False)
         return action
 
     def get_action(self):

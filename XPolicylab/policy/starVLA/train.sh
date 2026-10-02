@@ -37,8 +37,8 @@ case "${bench_name}:${env_cfg_type}" in
     SParkArena:tianji_marvin_wuji|spark:tianji_marvin_wuji|SparkArena:tianji_marvin_wuji|SParkRealBenchV5:tianji_marvin_wuji|spark_real_bench_v5:tianji_marvin_wuji|EgoVLA:ego_h1_inspire|egovla:ego_h1_inspire) ;;
     *) echo "[starVLA][ERROR] Use SParkArena or SParkRealBenchV5 with tianji_marvin_wuji, or EgoVLA/ego_h1_inspire" >&2; exit 2;;
 esac
-if [[ "${action_type}" != "joint" ]]; then
-    echo "[starVLA][ERROR] This HDF5 conversion uses joint-state action keys; action_type must be joint" >&2
+if [[ "${action_type}" != "joint" && "${action_type}" != "ee" ]]; then
+    echo "[starVLA][ERROR] action_type must be joint or ee" >&2
     exit 2
 fi
 
@@ -117,7 +117,7 @@ if [[ ! -f "${dataset_path}/meta/modality.json" ]]; then
     exit 1
 fi
 
-"${POLICY_PYTHON}" - "${dataset_path}" "${robot_type}" "${task_instruction_path}" "${bench_name}" <<'PY'
+"${POLICY_PYTHON}" - "${dataset_path}" "${robot_type}" "${task_instruction_path}" "${bench_name}" "${action_type}" <<'PY'
 import hashlib
 import json
 import sys
@@ -127,6 +127,7 @@ dataset_path = Path(sys.argv[1])
 robot_type = sys.argv[2]
 task_instruction_path = Path(sys.argv[3])
 bench_name = sys.argv[4]
+action_type = sys.argv[5]
 manifest_path = dataset_path / "conversion_manifest.json"
 if not manifest_path.is_file():
     raise SystemExit(f"[starVLA][ERROR] Dataset has no source manifest: {manifest_path}. Re-run process_data.sh.")
@@ -140,20 +141,29 @@ camera_keys = [
     "observation.images.cam_right_wrist",
 ]
 if robot_type == "xpolicylab_egovla":
-    expected_dim = 38
-    expected_kind = "ego"
+    expected_dim = 42 if action_type == "ee" else 38
+    expected_kind = "ego_ee" if action_type == "ee" else "ego"
     expected_video = {
         camera_keys[0]: "observations/images/main",
         camera_keys[1]: "constant_black",
         camera_keys[2]: "constant_black",
     }
-    expected_action = "action"
+    expected_action = (
+        [
+            "observations/left_target_ee_pose", "action (left hand indices)",
+            "observations/right_target_ee_pose", "action (right hand indices)",
+        ]
+        if action_type == "ee" else "action"
+    )
     expected_black = camera_keys[1:]
-    expected_groups = [
-        ("left_arm", 0, 7), ("left_ee", 7, 19),
-        ("right_arm", 19, 26), ("right_ee", 26, 38),
-    ]
-    expected_indices = {
+    expected_groups = (
+        [("left_ee_pose", 0, 9), ("left_hand", 9, 21),
+         ("right_ee_pose", 21, 30), ("right_hand", 30, 42)]
+        if action_type == "ee" else
+        [("left_arm", 0, 7), ("left_ee", 7, 19),
+         ("right_arm", 19, 26), ("right_ee", 26, 38)]
+    )
+    expected_indices = None if action_type == "ee" else {
         "left_arm_joint_states": [4,8,12,16,20,22,24],
         "left_ee_joint_states": [26,36,27,37,28,38,29,39,30,40,46,48],
         "right_arm_joint_states": [5,9,13,17,21,23,25],
@@ -170,18 +180,21 @@ if robot_type == "xpolicylab_egovla":
     ).encode("utf-8")
     expected_instruction_hash = hashlib.sha256(instruction_payload).hexdigest()
 else:
-    expected_dim = 54
+    expected_dim = 58 if action_type == "ee" else 54
     is_spark_real = bench_name in {"SParkRealBenchV5", "spark_real_bench_v5"}
-    expected_kind = "spark_real_bench_v5" if is_spark_real else "spark"
+    expected_kind = "spark_real_bench_v5" if is_spark_real else ("spark_ee" if action_type == "ee" else "spark")
     expected_video = {
         camera_keys[0]: "vision/cam_head/colors",
         camera_keys[1]: "vision/cam_left_wrist/colors",
         camera_keys[2]: "vision/cam_right_wrist/colors",
     }
-    expected_action = [
-        "action/left_arm_joint_states", "action/left_ee_joint_states",
-        "action/right_arm_joint_states", "action/right_ee_joint_states",
-    ]
+    expected_action = (
+        ["action/left_ee_poses", "action/left_ee_joint_states",
+         "action/right_ee_poses", "action/right_ee_joint_states"]
+        if action_type == "ee" else
+        ["action/left_arm_joint_states", "action/left_ee_joint_states",
+         "action/right_arm_joint_states", "action/right_ee_joint_states"]
+    )
     expected_black = []
     expected_indices = None
     expected_instruction_mapping = (
@@ -198,10 +211,13 @@ else:
             ensure_ascii=False,
         ).encode("utf-8")
         expected_instruction_hash = hashlib.sha256(instruction_payload).hexdigest()
-    expected_groups = [
-        ("left_arm", 0, 7), ("left_ee", 7, 27),
-        ("right_arm", 27, 34), ("right_ee", 34, 54),
-    ]
+    expected_groups = (
+        [("left_ee_pose", 0, 9), ("left_hand", 9, 29),
+         ("right_ee_pose", 29, 38), ("right_hand", 38, 58)]
+        if action_type == "ee" else
+        [("left_arm", 0, 7), ("left_ee", 7, 27),
+         ("right_arm", 27, 34), ("right_ee", 34, 54)]
+    )
 
 errors = []
 def require(condition, message):
@@ -215,7 +231,7 @@ require(manifest.get("camera_keys") == camera_keys, f"camera_keys must be {camer
 require(manifest.get("source_keys", {}).get("video") == expected_video, "camera provenance is stale")
 require(manifest.get("source_keys", {}).get("action") == expected_action, "labels are not sourced from raw HDF5 action")
 require(manifest.get("action_contract") == {
-    "source": "raw_hdf5_action",
+    "source": "raw_hdf5_action_same_timestep",
     "selected_indices": expected_indices,
     "temporal_offset": 0,
     "derived_from_state": False,
@@ -298,14 +314,14 @@ print(f"[starVLA] dataset contract verified: raw action, cameras={camera_keys}, 
 PY
 
 mkdir -p "$(dirname "${config_yaml}")"
-"${POLICY_PYTHON}" - "${base_config_yaml}" "${config_yaml}" "${data_root_dir}" "${data_mix}" "${run_id}" "${seed}" "${robot_type}" "${dataset_path}" "${base_vlm}" <<'PY'
+"${POLICY_PYTHON}" - "${base_config_yaml}" "${config_yaml}" "${data_root_dir}" "${data_mix}" "${run_id}" "${seed}" "${robot_type}" "${dataset_path}" "${base_vlm}" "${action_type}" <<'PY'
 import hashlib
 import json
 import os
 import sys
 import yaml
 
-src, dst, data_root_dir, data_mix, run_id, seed, robot_type, dataset_path, base_vlm = sys.argv[1:10]
+src, dst, data_root_dir, data_mix, run_id, seed, robot_type, dataset_path, base_vlm, action_type = sys.argv[1:11]
 with open(src, "r", encoding="utf-8") as fp:
     cfg = yaml.safe_load(fp)
 dataset_path = os.path.realpath(dataset_path)
@@ -328,7 +344,8 @@ vla_data_cfg["dataset_path"] = dataset_path
 vla_data_cfg["conversion_manifest_sha256"] = conversion_manifest_sha256
 vla_data_cfg["raw_dataset_manifest"] = manifest.get("raw_dataset_manifest")
 vla_data_cfg["action_mode"] = "abs"
-vla_data_cfg["action_source"] = "raw_hdf5_action"
+vla_data_cfg["action_type"] = "abs_ee" if action_type == "ee" else "abs_qpos"
+vla_data_cfg["action_source"] = "raw_hdf5_action_same_timestep"
 vla_data_cfg["action_temporal_offset"] = 0
 vla_data_cfg["action_derived_from_state"] = False
 vla_data_cfg["include_state"] = True
@@ -338,6 +355,7 @@ vla_data_cfg["black_camera_names"] = (
     ["cam_left_wrist", "cam_right_wrist"]
     if robot_type == "xpolicylab_egovla" else []
 )
+vla_data_cfg["pose_format"] = "abs_xyz_rot6d" if action_type == "ee" else None
 vla_data_cfg["instruction_mapping_sha256"] = manifest.get(
     "instruction_contract", {}
 ).get("mapping_sha256")
@@ -367,16 +385,26 @@ else:
 vla_data_cfg["xpolicylab_schema"] = {
     "version": 1,
     "robot_type": robot_type,
+    "action_type": action_type,
+    "pose_format": "abs_xyz_rot6d" if action_type == "ee" else None,
+    "raw_action_dim": (38 if robot_type == "xpolicylab_egovla" else 54),
     "normalization_mode": normalization_mode,
     "state_dtype": "float16",
     "state": state_entries,
     "action": action_entries,
     "source_action_component_indices": source_action_component_indices,
     "source_action_keys": manifest["source_keys"]["action"],
+    "action_type": action_type,
+    "pose_format": "abs_xyz_rot6d" if action_type == "ee" else None,
 }
-dim = 38 if robot_type == "xpolicylab_egovla" else 54
+dim = (42 if robot_type == "xpolicylab_egovla" else 58) if action_type == "ee" else (38 if robot_type == "xpolicylab_egovla" else 54)
+vla_data_cfg["xpolicylab_schema"]["model_action_dim"] = dim
 cfg["framework"]["action_model"]["action_dim"] = dim
 cfg["framework"]["action_model"]["state_dim"] = dim
+cfg["framework"]["action_model"]["action_horizon"] = 50
+cfg["framework"]["action_model"]["future_action_window_size"] = 49
+cfg["framework"]["action_model"]["repeated_diffusion_steps"] = 6
+cfg.setdefault("trainer", {})["repeated_diffusion_steps"] = 6
 
 with open(dst, "w", encoding="utf-8") as fp:
     yaml.safe_dump(cfg, fp, sort_keys=False)
@@ -513,6 +541,7 @@ PYTHONPATH="${STARVLA_ROOT}:${PYTHONPATH:-}" \
 STARVLA_XPOLICY_DATASET_NAME="${dataset_name}" \
 STARVLA_XPOLICY_DATA_MIX="${data_mix}" \
 STARVLA_XPOLICY_ROBOT_TYPE="${robot_type}" \
+STARVLA_XPOLICY_ACTION_TYPE="${action_type}" \
 WANDB_MODE="${WANDB_MODE:-online}" \
 NO_ALBUMENTATIONS_UPDATE="${NO_ALBUMENTATIONS_UPDATE:-1}" \
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \

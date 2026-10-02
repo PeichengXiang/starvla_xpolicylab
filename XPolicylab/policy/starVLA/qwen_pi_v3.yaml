@@ -17,10 +17,10 @@ framework:
     action_model_type: LayerwiseFM
     action_dim: 54
     state_dim: 54
-    action_horizon: 16
-    future_action_window_size: 15
+    action_horizon: 50
+    future_action_window_size: 49
     past_action_window_size: 0
-    repeated_diffusion_steps: 2
+    repeated_diffusion_steps: 6
     num_inference_timesteps: 4
     add_pos_embed: true
     max_seq_len: 1024
@@ -52,6 +52,7 @@ datasets:
     action_source: raw_hdf5_action
     action_temporal_offset: 0
     action_derived_from_state: false
+    pose_format: null
     xpolicylab_normalization_mode: q99
     camera_names: [cam_head, cam_left_wrist, cam_right_wrist]
     black_camera_names: []
@@ -79,6 +80,7 @@ trainer:
   logging_frequency: 10
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
+  repeated_diffusion_steps: 6
   gradient_checkpointing: true
   optimizer:
     name: AdamW

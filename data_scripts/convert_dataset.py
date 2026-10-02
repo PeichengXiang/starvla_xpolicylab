@@ -28,7 +28,36 @@ SPARK_REAL_TASK_INSTRUCTIONS = json.loads(
         encoding='utf-8'
     )
 )
-SPARK_KINDS = {'spark', 'spark_real_bench_v5'}
+SPARK_KINDS = {'spark', 'spark_real_bench_v5', 'spark_ee'}
+EGO_KINDS = {'ego', 'ego_ee'}
+
+
+def quat_wxyz_to_rot6d(pose):
+    """Convert [x,y,z,qw,qx,qy,qz] to [x,y,z,first-two-rows(R)]."""
+    arr = np.asarray(pose, dtype=np.float32)
+    if arr.shape[-1] != 7:
+        raise ValueError(f'EE pose must have width 7, got {arr.shape}')
+    if not np.isfinite(arr).all():
+        raise ValueError('EE pose contains non-finite values')
+    xyz = arr[..., :3]
+    q = arr[..., 3:7]
+    norm = np.linalg.norm(q, axis=-1, keepdims=True)
+    if np.any(norm < 1e-8):
+        raise ValueError('EE pose contains a zero quaternion')
+    q = q / norm
+    w, x, y, z = [q[..., i] for i in range(4)]
+    rot6d = np.stack(
+        [
+            1 - 2 * (y * y + z * z),
+            2 * (x * y - z * w),
+            2 * (x * z + y * w),
+            2 * (x * y + z * w),
+            1 - 2 * (x * x + z * z),
+            2 * (y * z - x * w),
+        ],
+        axis=-1,
+    )
+    return np.concatenate([xyz, rot6d], axis=-1).astype(np.float32)
 
 def mapping_sha256(mapping):
     payload=json.dumps(mapping,sort_keys=True,separators=(',',':'),ensure_ascii=False)
@@ -103,6 +132,14 @@ def h5_text(handle, key):
         return bytes(value).decode(errors='replace')
     return str(value)
 
+
+def h5_first_array(handle, *keys):
+    """Read the first available dataset name from a raw HDF5 schema variant."""
+    for key in keys:
+        if key in handle:
+            return handle[key][()]
+    raise KeyError(f"None of the raw HDF5 keys exist: {keys}")
+
 def update_max_abs(current, lhs, rhs, label):
     delta=np.asarray(lhs,dtype=np.float64)-np.asarray(rhs,dtype=np.float64)
     if delta.size == 0:
@@ -146,6 +183,10 @@ def write_meta(out, dim, camera_keys, episodes, frames, tasks, fps):
         groups=[('left_arm',0,7),('left_ee',7,27),('right_arm',27,34),('right_ee',34,54)]
     elif dim==38:
         groups=[('left_arm',0,7),('left_ee',7,19),('right_arm',19,26),('right_ee',26,38)]
+    elif dim==58:
+        groups=[('left_ee_pose',0,9),('left_hand',9,29),('right_ee_pose',29,38),('right_hand',38,58)]
+    elif dim==42:
+        groups=[('left_ee_pose',0,9),('left_hand',9,21),('right_ee_pose',21,30),('right_hand',30,42)]
     else: groups=[('all',0,dim)]
     for root in ('state','action'):
         for name,s,e in groups: modality[root][name]={'start':s,'end':e,'absolute':True,'dtype':'float32','original_key':'observation.state' if root=='state' else 'action'}
@@ -155,7 +196,7 @@ def write_meta(out, dim, camera_keys, episodes, frames, tasks, fps):
     (out/'meta/modality.json').write_text(json.dumps(modality,indent=2))
     features={'observation.state':feature_vec(dim),'action':feature_vec(dim),'timestamp':{'dtype':'float32','shape':[1],'names':None},'frame_index':{'dtype':'int64','shape':[1],'names':None},'episode_index':{'dtype':'int64','shape':[1],'names':None},'index':{'dtype':'int64','shape':[1],'names':None},'task_index':{'dtype':'int64','shape':[1],'names':None}}
     for key in camera_keys: features[key]=feature_image(key,fps=fps)
-    info={'codebase_version':'v3.0','robot_type':'tianji_marvin_wuji' if dim==54 else 'ego_h1_inspire','total_episodes':episodes,'total_frames':frames,'total_tasks':tasks,'chunks_size':1000,'data_files_size_in_mb':100,'video_files_size_in_mb':200,'fps':fps,'splits':{'train':f'0:{episodes}'},'data_path':'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet','video_path':'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4','features':features}
+    info={'codebase_version':'v3.0','robot_type':'tianji_marvin_wuji' if dim in (54,58) else 'ego_h1_inspire','total_episodes':episodes,'total_frames':frames,'total_tasks':tasks,'chunks_size':1000,'data_files_size_in_mb':100,'video_files_size_in_mb':200,'fps':fps,'splits':{'train':f'0:{episodes}'},'data_path':'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet','video_path':'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4','features':features}
     (out/'meta/info.json').write_text(json.dumps(info,indent=2))
 
 def write_video(frames, path, fps):
@@ -215,6 +256,10 @@ def convert_spark(source,out,limit=None,keep=False,workers=1):
     paths=sorted(Path(source).glob('*/tianji_marvin_wuji/data/episode_*.hdf5'))
     return convert(paths,out,'spark',limit,keep,source=source,workers=workers)
 
+def convert_spark_ee(source,out,limit=None,keep=False,workers=1):
+    paths=sorted(Path(source).glob('*/tianji_marvin_wuji/data/episode_*.hdf5'))
+    return convert(paths,out,'spark_ee',limit,keep,source=source,workers=workers)
+
 def convert_spark_real(source,out,limit=None,keep=False,workers=1):
     paths=[]
     for task in sorted(Path(source).glob('*')):
@@ -229,6 +274,12 @@ def convert_ego(source,out,limit=None,keep=False,workers=1):
         if task.is_dir(): paths += sorted(task.glob('episode_*.hdf5'))
     return convert(paths,out,'ego',limit,keep,source=source,workers=workers)
 
+def convert_ego_ee(source,out,limit=None,keep=False,workers=1):
+    paths=[]
+    for task in sorted(Path(source).glob('*')):
+        if task.is_dir(): paths += sorted(task.glob('episode_*.hdf5'))
+    return convert(paths,out,'ego_ee',limit,keep,source=source,workers=workers)
+
 def convert(paths,out,kind,limit,keep,source=None,workers=1):
     if keep:
         raise ValueError('--keep-existing is incompatible with fail-closed conversion')
@@ -239,12 +290,12 @@ def convert(paths,out,kind,limit,keep,source=None,workers=1):
         raise FileExistsError(f'Refusing to overwrite existing output: {final}')
 
     raw_manifest=None
-    if kind == 'ego':
+    if kind in EGO_KINDS:
         raw_manifest=raw_dataset_manifest_provenance(source)
     elif kind == 'spark_real_bench_v5':
         raw_manifest=spark_real_manifest_provenance(source,len(paths),limit is not None)
     final.parent.mkdir(parents=True,exist_ok=True)
-    atomic=kind in {'ego','spark_real_bench_v5'}
+    atomic=kind in {'ego','ego_ee','spark_real_bench_v5'}
     if atomic:
         stage=stage_path(final)
         if path_lexists(stage):
@@ -270,7 +321,7 @@ def convert(paths,out,kind,limit,keep,source=None,workers=1):
 def _convert_into(paths,out,kind,raw_manifest,workers):
     (out/'data/chunk-000').mkdir(parents=True,exist_ok=True); (out/'meta/episodes/chunk-000').mkdir(parents=True,exist_ok=True)
     rows=[]; erows=[]; task_map={}; total=0; fps=30; dataset_fps=None
-    dim=54 if kind in SPARK_KINDS else 38
+    dim=58 if kind == 'spark_ee' else (42 if kind == 'ego_ee' else (54 if kind in SPARK_KINDS else 38))
     cams=CAMERA_KEYS
     black_templates={}
     black_template_dir=out/'.black-video-templates'
@@ -299,12 +350,26 @@ def _convert_into(paths,out,kind,raw_manifest,workers):
                         f'{p}: fps={fps} differs from dataset fps={dataset_fps}'
                     )
                 instruction=f['instruction'][()].decode(errors='replace') if 'instruction' in f and isinstance(f['instruction'][()],bytes) else (str(f['instruction'][()]) if 'instruction' in f else p.parent.parent.name.replace('_',' '))
-                state_parts={name:f[f'state/{name}'][()] for name in ('left_arm_joint_states','left_ee_joint_states','right_arm_joint_states','right_ee_joint_states')}
-                action_parts={name:f[f'action/{name}'][()] for name in ('left_arm_joint_states','left_ee_joint_states','right_arm_joint_states','right_ee_joint_states')}
+                if kind == 'spark_ee':
+                    state_parts={
+                        'left_ee_pose': quat_wxyz_to_rot6d(f['state/left_ee_poses'][()]),
+                        'left_hand': f['state/left_ee_joint_states'][()],
+                        'right_ee_pose': quat_wxyz_to_rot6d(f['state/right_ee_poses'][()]),
+                        'right_hand': f['state/right_ee_joint_states'][()],
+                    }
+                    action_parts={
+                        'left_ee_pose': quat_wxyz_to_rot6d(f['action/left_ee_poses'][()]),
+                        'left_hand': f['action/left_ee_joint_states'][()],
+                        'right_ee_pose': quat_wxyz_to_rot6d(f['action/right_ee_poses'][()]),
+                        'right_hand': f['action/right_ee_joint_states'][()],
+                    }
+                else:
+                    state_parts={name:f[f'state/{name}'][()] for name in ('left_arm_joint_states','left_ee_joint_states','right_arm_joint_states','right_ee_joint_states')}
+                    action_parts={name:f[f'action/{name}'][()] for name in ('left_arm_joint_states','left_ee_joint_states','right_arm_joint_states','right_ee_joint_states')}
                 state=np.concatenate(list(state_parts.values()),axis=1).astype('float32')
                 # Intentionally use canonical action[t] at the same row.  Arm labels
-                # are upstream next-state targets; hand labels are upstream aligned
-                # master commands.  This converter never constructs or shifts either.
+                # may numerically equal the next state in some sources; this
+                # converter never constructs or shifts action from state.
                 action=np.concatenate(list(action_parts.values()),axis=1).astype('float32')
                 frame_lengths={
                     key:len(f[f'vision/{camera}/colors'])
@@ -357,8 +422,24 @@ def _convert_into(paths,out,kind,raw_manifest,workers):
             else:
                 task=p.parent.name; instruction=task_text(task); fps=30
                 q=f['observations/qpos'][()]; a=f['action'][()]
-                state=np.concatenate([q[:,list(i)] for i in EGO_INDICES.values()],axis=1).astype('float32')
-                action=np.concatenate([a[:,list(i)] for i in EGO_INDICES.values()],axis=1).astype('float32')
+                if kind == 'ego_ee':
+                    state=np.concatenate([
+                        quat_wxyz_to_rot6d(h5_first_array(f, 'observations/left_ee_pose', 'observations/left_curr_ee_pose')),
+                        q[:,list(EGO_INDICES['left_ee_joint_states'])],
+                        quat_wxyz_to_rot6d(h5_first_array(f, 'observations/right_ee_pose', 'observations/right_curr_ee_pose')),
+                        q[:,list(EGO_INDICES['right_ee_joint_states'])],
+                    ],axis=1).astype('float32')
+                    # Recorded commanded EE targets are same-row raw actions;
+                    # never construct labels from qpos[t+1].
+                    action=np.concatenate([
+                        quat_wxyz_to_rot6d(f['observations/left_target_ee_pose'][()]),
+                        a[:,list(EGO_INDICES['left_ee_joint_states'])],
+                        quat_wxyz_to_rot6d(f['observations/right_target_ee_pose'][()]),
+                        a[:,list(EGO_INDICES['right_ee_joint_states'])],
+                    ],axis=1).astype('float32')
+                else:
+                    state=np.concatenate([q[:,list(i)] for i in EGO_INDICES.values()],axis=1).astype('float32')
+                    action=np.concatenate([a[:,list(i)] for i in EGO_INDICES.values()],axis=1).astype('float32')
                 images=f['observations/images/main'][:]
                 frame_lists={
                     'observation.images.cam_high':[im for im in images],
@@ -430,33 +511,70 @@ def _convert_into(paths,out,kind,raw_manifest,workers):
     pd.DataFrame(erows).to_parquet(out/'meta/episodes/chunk-000/file-000.parquet',index=False)
     pd.DataFrame({'task_index':list(task_map.values())},index=list(task_map.keys())).to_parquet(out/'meta/tasks.parquet')
     write_meta(out,dim,cams,len(erows),total,len(task_map),dataset_fps or fps)
-    source_keys = ({
-        'video': {
-            'observation.images.cam_high': 'vision/cam_head/colors',
-            'observation.images.cam_left_wrist': 'vision/cam_left_wrist/colors',
-            'observation.images.cam_right_wrist': 'vision/cam_right_wrist/colors',
-        },
-        'state': ['state/left_arm_joint_states', 'state/left_ee_joint_states',
-                  'state/right_arm_joint_states', 'state/right_ee_joint_states'],
-        'action': ['action/left_arm_joint_states', 'action/left_ee_joint_states',
-                   'action/right_arm_joint_states', 'action/right_ee_joint_states'],
-        'language': 'instruction',
-    } if kind in SPARK_KINDS else {
-        'video': {
-            'observation.images.cam_high': 'observations/images/main',
-            'observation.images.cam_left_wrist': 'constant_black',
-            'observation.images.cam_right_wrist': 'constant_black',
-        },
-        'state': 'observations/qpos (38 selected indices)',
-        'action': 'action',
-        'language': 'task directory name',
-    })
+    if kind == 'spark_ee':
+        source_keys = {
+            'video': {
+                'observation.images.cam_high': 'vision/cam_head/colors',
+                'observation.images.cam_left_wrist': 'vision/cam_left_wrist/colors',
+                'observation.images.cam_right_wrist': 'vision/cam_right_wrist/colors',
+            },
+            'state': [
+                'state/left_ee_poses', 'state/left_ee_joint_states',
+                'state/right_ee_poses', 'state/right_ee_joint_states',
+            ],
+            'action': [
+                'action/left_ee_poses', 'action/left_ee_joint_states',
+                'action/right_ee_poses', 'action/right_ee_joint_states',
+            ],
+            'language': 'instruction',
+        }
+    elif kind in SPARK_KINDS:
+        source_keys = {
+            'video': {
+                'observation.images.cam_high': 'vision/cam_head/colors',
+                'observation.images.cam_left_wrist': 'vision/cam_left_wrist/colors',
+                'observation.images.cam_right_wrist': 'vision/cam_right_wrist/colors',
+            },
+            'state': ['state/left_arm_joint_states', 'state/left_ee_joint_states',
+                      'state/right_arm_joint_states', 'state/right_ee_joint_states'],
+            'action': ['action/left_arm_joint_states', 'action/left_ee_joint_states',
+                       'action/right_arm_joint_states', 'action/right_ee_joint_states'],
+            'language': 'instruction',
+        }
+    elif kind == 'ego_ee':
+        source_keys = {
+            'video': {
+                'observation.images.cam_high': 'observations/images/main',
+                'observation.images.cam_left_wrist': 'constant_black',
+                'observation.images.cam_right_wrist': 'constant_black',
+            },
+            'state': [
+                'observations/left_ee_pose', 'observations/qpos (left hand indices)',
+                'observations/right_ee_pose', 'observations/qpos (right hand indices)',
+            ],
+            'action': [
+                'observations/left_target_ee_pose', 'action (left hand indices)',
+                'observations/right_target_ee_pose', 'action (right hand indices)',
+            ],
+            'language': 'task directory name',
+        }
+    else:
+        source_keys = {
+            'video': {
+                'observation.images.cam_high': 'observations/images/main',
+                'observation.images.cam_left_wrist': 'constant_black',
+                'observation.images.cam_right_wrist': 'constant_black',
+            },
+            'state': 'observations/qpos (38 selected indices)',
+            'action': 'action',
+            'language': 'task directory name',
+        }
     conversion_manifest={
         'contract_version': 2,
         'kind': kind, 'episodes': [str(p) for p in paths], 'action_dim': dim,
         'camera_keys': cams, 'source_keys': source_keys,
         'action_contract': {
-            'source': 'raw_hdf5_action',
+            'source': 'raw_hdf5_action_same_timestep',
             'selected_indices': (
                 {name: list(indices) for name, indices in EGO_INDICES.items()}
                 if kind == 'ego' else None
@@ -476,7 +594,7 @@ def _convert_into(paths,out,kind,raw_manifest,workers):
             'source': 'EgoVLA official LANGUAGE_MAPPING',
             'mapping': EGO_TASK_INSTRUCTIONS,
             'mapping_sha256': mapping_sha256(EGO_TASK_INSTRUCTIONS),
-        } if kind == 'ego' else {
+        } if kind in EGO_KINDS else {
             'source': 'SParkRealBenchV5 canonical task registry',
             'mapping': SPARK_REAL_TASK_INSTRUCTIONS,
             'mapping_sha256': mapping_sha256(SPARK_REAL_TASK_INSTRUCTIONS),
@@ -485,6 +603,22 @@ def _convert_into(paths,out,kind,raw_manifest,workers):
         }),
         'source_is_external': True,
     }
+    if kind == 'spark_ee':
+        conversion_manifest['pose_contract']={
+            'representation': 'abs_xyz_rot6d',
+            'raw_pose_order': '[x,y,z,qw,qx,qy,qz]',
+            'rot6d_convention': 'rotation_matrix_first_two_rows_row_major',
+            'state_pose_source': 'state/{left,right}_ee_poses',
+            'action_pose_source': 'action/{left,right}_ee_poses_same_timestep',
+        }
+    elif kind == 'ego_ee':
+        conversion_manifest['pose_contract']={
+            'representation': 'abs_xyz_rot6d',
+            'raw_pose_order': '[x,y,z,qw,qx,qy,qz]',
+            'rot6d_convention': 'rotation_matrix_first_two_rows_row_major',
+            'state_pose_source': 'observations/{left,right}_ee_pose_or_curr_ee_pose',
+            'action_pose_source': 'observations/{left,right}_target_ee_pose_same_timestep',
+        }
     if kind == 'spark_real_bench_v5':
         conversion_manifest['upstream_action_contract']={
             'arm': {
@@ -507,9 +641,9 @@ def _convert_into(paths,out,kind,raw_manifest,workers):
     return len(erows),total,dim
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('benchmark',choices=['spark','spark_real_bench_v5','egovla']); ap.add_argument('--source',required=True); ap.add_argument('--output',required=True); ap.add_argument('--limit',type=int); ap.add_argument('--keep-existing',action='store_true'); ap.add_argument('--workers',type=int,default=1); a=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument('benchmark',choices=['spark','spark_ee','spark_real_bench_v5','egovla','ego_ee']); ap.add_argument('--source',required=True); ap.add_argument('--output',required=True); ap.add_argument('--limit',type=int); ap.add_argument('--keep-existing',action='store_true'); ap.add_argument('--workers',type=int,default=1); a=ap.parse_args()
     if a.workers <= 0:
         ap.error('--workers must be positive')
-    converter={'spark':convert_spark,'spark_real_bench_v5':convert_spark_real,'egovla':convert_ego}[a.benchmark]
+    converter={'spark':convert_spark,'spark_ee':convert_spark_ee,'spark_real_bench_v5':convert_spark_real,'egovla':convert_ego,'ego_ee':convert_ego_ee}[a.benchmark]
     converter(a.source,a.output,a.limit,a.keep_existing,a.workers)
 if __name__=='__main__': main()

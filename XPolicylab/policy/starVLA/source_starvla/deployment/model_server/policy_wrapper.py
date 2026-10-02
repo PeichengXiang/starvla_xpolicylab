@@ -57,6 +57,8 @@ def _training_data_contract(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
     vla_data_cfg = model_cfg.get("datasets", {}).get("vla_data", {})
     return {
         "action_mode": vla_data_cfg.get("action_mode"),
+        "action_type": vla_data_cfg.get("action_type"),
+        "pose_format": vla_data_cfg.get("pose_format"),
         "action_source": vla_data_cfg.get("action_source"),
         "action_temporal_offset": vla_data_cfg.get("action_temporal_offset"),
         "action_derived_from_state": vla_data_cfg.get("action_derived_from_state"),

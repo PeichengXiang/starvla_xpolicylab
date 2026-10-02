@@ -19,10 +19,20 @@ case "$bench_name" in
     mode=egovla; source="${STARVLA_EGOVLA_RAW_ROOT:-$ROOT_DIR/data/raw_sources/EgoVLA}";;
   *) echo "Unsupported benchmark: $bench_name (use SParkArena, SParkRealBenchV5, or EgoVLA)" >&2; exit 2;;
 esac
-[[ "$action_type" == "joint" ]] || { echo "This converter reads HDF5 joint-state action keys; use action_type=joint" >&2; exit 2; }
+case "$action_type" in
+  joint) ;;
+  ee)
+    case "$mode" in
+      spark) mode=spark_ee;;
+      egovla) mode=ego_ee;;
+      *) echo "Absolute EE conversion is only supported for SParkArena and EgoVLA" >&2; exit 2;;
+    esac
+    ;;
+  *) echo "action_type must be joint or ee" >&2; exit 2;;
+esac
 out="$ROOT_DIR/data/${bench_name}-${ckpt_name}-${env_cfg_type}-${action_type}"
 args=("$mode" --source "$source" --output "$out")
-if [[ "$mode" == "spark_real_bench_v5" ]]; then
+if [[ "$mode" == "spark" || "$mode" == "spark_ee" || "$mode" == "spark_real_bench_v5" ]]; then
   args+=(--workers "${STARVLA_CONVERT_WORKERS:-4}")
 fi
 [[ -n "$limit" ]] && args+=(--limit "$limit")

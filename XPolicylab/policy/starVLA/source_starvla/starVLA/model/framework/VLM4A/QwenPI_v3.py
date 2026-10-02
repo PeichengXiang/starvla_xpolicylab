@@ -309,7 +309,7 @@ class Qwen_PI_v3(baseframework):
                 in {"xpolicylab_egovla", "xpolicylab_sparkarena"}
             )
             if requires_exact_raw_action and not (
-                vla_data_cfg.get("action_source") == "raw_hdf5_action"
+                vla_data_cfg.get("action_source") == "raw_hdf5_action_same_timestep"
                 and vla_data_cfg.get("action_temporal_offset") == 0
                 and vla_data_cfg.get("action_derived_from_state") is False
             ):

@@ -18,6 +18,7 @@ class RuntimeDataConfig:
         groups,
         source_action_keys,
         source_action_component_indices=None,
+        action_indices=None,
     ):
         self.video_keys = [f"video.{x}" for x in cameras]
         self.groups = groups
@@ -38,6 +39,8 @@ class RuntimeDataConfig:
                 )
             ]
         )
+        if action_indices is not None:
+            self.action_indices = list(action_indices)
     def modality_config(self):
         return {"video": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.video_keys), "state": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.state_keys), "action": ModalityConfig(delta_indices=self.action_indices, modality_keys=self.action_keys), "language": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.language_keys)}
     def transform(self):
@@ -55,6 +58,17 @@ SPARK = RuntimeDataConfig(
         "action/right_arm_joint_states", "action/right_ee_joint_states",
     ],
 )
+SPARK_EE = RuntimeDataConfig(
+    58,
+    ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+    [("left_ee_pose",0,9),("left_hand",9,29),
+     ("right_ee_pose",29,38),("right_hand",38,58)],
+    [
+        "action/left_ee_poses", "action/left_ee_joint_states",
+        "action/right_ee_poses", "action/right_ee_joint_states",
+    ],
+    action_indices=list(range(50)),
+)
 # EgoVLA is physically single-view.  Keep the model's fixed three-slot image
 # contract by reading the two all-black wrist streams created by the converter.
 EGO = RuntimeDataConfig(
@@ -69,7 +83,24 @@ EGO = RuntimeDataConfig(
         [31,41,32,42,33,43,34,44,35,45,47,49],
     ],
 )
-ROBOT_TYPE_CONFIG_MAP = {"xpolicylab_sparkarena": SPARK, "xpolicylab_egovla": EGO}
+EGO_EE = RuntimeDataConfig(
+    42,
+    ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+    [("left_ee_pose",0,9),("left_hand",9,21),
+     ("right_ee_pose",21,30),("right_hand",30,42)],
+    [
+        "observations/left_target_ee_pose", "action (left hand indices)",
+        "observations/right_target_ee_pose", "action (right hand indices)",
+    ],
+    action_indices=list(range(50)),
+)
+_action_type = os.environ.get("STARVLA_XPOLICY_ACTION_TYPE", "joint").strip().lower()
+if _action_type not in {"joint", "ee"}:
+    raise ValueError(f"Unsupported STARVLA_XPOLICY_ACTION_TYPE={_action_type!r}")
+ROBOT_TYPE_CONFIG_MAP = {
+    "xpolicylab_sparkarena": SPARK_EE if _action_type == "ee" else SPARK,
+    "xpolicylab_egovla": EGO_EE if _action_type == "ee" else EGO,
+}
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {}
 _dataset = os.environ.get("STARVLA_XPOLICY_DATASET_NAME")
 _robot = os.environ.get("STARVLA_XPOLICY_ROBOT_TYPE", "xpolicylab_sparkarena")

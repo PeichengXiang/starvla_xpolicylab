@@ -3,7 +3,7 @@ protocol: ws
 bench_name: null
 task_name: null
 env_cfg_type: tianji_marvin_wuji
-action_type: joint
+action_type: ee
 gpu_id: null
 seed: null
 eval_batch: true
@@ -19,9 +19,9 @@ starvla_server_host: 127.0.0.1
 starvla_server_port: 5694
 unnorm_key: auto
 use_ddim: true
-num_ddim_steps: 10
+num_ddim_steps: 4
 image_size: [224, 224]
-execute_horizon: 16
+execute_horizon: 50
 include_state: auto
 require_runtime_contract: true
 required_pi_v3_forward: null

@@ -19,7 +19,7 @@ starvla_server_host: 127.0.0.1
 starvla_server_port: 5694
 unnorm_key: arx_x5
 use_ddim: true
-num_ddim_steps: 10
+num_ddim_steps: 4
 image_size: [224, 224]
 execute_horizon: 16
 include_state: auto
