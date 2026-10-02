@@ -344,7 +344,8 @@ class Model(ModelTemplate):
                     "include_state": self.include_state,
                     "instruction_mapping_sha256": self.instruction_mapping_sha256,
                     **_expected_xpolicylab_schema(self.env_cfg_type, self.action_type),
-                    "action_type": self.action_type,
+                    # Training records absolute EE as abs_ee; the eval CLI still says ee.
+                    "action_type": "abs_ee" if self.action_type == "ee" else self.action_type,
                     "pose_format": "abs_xyz_rot6d" if self.action_type == "ee" else None,
                 }
             validate_server_runtime_contract(
