@@ -22,6 +22,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 XPL_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BENCH_ROOT="$(cd "${XPL_ROOT}/.." && pwd)"
 UTILS_DIR="${XPL_ROOT}/utils"
+# The simulator entrypoint lives in the benchmark checkout, not this git repo.
+case "${bench_name}" in
+    EgoVLA|EgoVLA_benchmark)
+        SIM_BENCH_ROOT="${STARVLA_SIM_BENCH_ROOT:-/personal/xiangpc/EgoVLA benchmark}"
+        ;;
+    *)
+        SIM_BENCH_ROOT="${STARVLA_SIM_BENCH_ROOT:-/personal/wenwei/xspark-0-simeval}"
+        ;;
+esac
+if [[ ! -f "${SIM_BENCH_ROOT}/scripts/eval_policy.sh" ]]; then
+    echo "[CLIENT][ERROR] simulator eval_policy.sh not found under ${SIM_BENCH_ROOT}" >&2
+    exit 1
+fi
 
 policy_name="$(basename "${SCRIPT_DIR}")"
 case "${env_cfg_type}" in
@@ -41,7 +54,7 @@ if [[ "${STARVLA_DIRECT_ROBODOJO_CLIENT:-0}" == "1" ]]; then
         "${env_cfg_type}" \
         "${policy_name}" \
         "${additional_info}" \
-        "${BENCH_ROOT}" \
+        "${SIM_BENCH_ROOT}" \
         "${seed}" \
         "${env_gpu_id}" \
         "${policy_server_host}"
@@ -57,7 +70,7 @@ bash "${UTILS_DIR}/setup_env_client.sh" \
     "${env_cfg_type}" \
     "${policy_name}" \
     "${additional_info}" \
-    "${BENCH_ROOT}" \
+    "${SIM_BENCH_ROOT}" \
     "${seed}" \
     "${env_gpu_id}" \
     "${policy_server_host}"
